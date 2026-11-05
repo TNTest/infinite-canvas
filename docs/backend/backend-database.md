@@ -23,6 +23,7 @@ description: 当前后端主要数据表与字段说明
 
 - `users`
 - `user_api_keys`
+- `user_api_key_audit_logs`
 - `credit_logs`
 - `prompts`
 - `agent_skills`
@@ -76,11 +77,34 @@ description: 当前后端主要数据表与字段说明
 | `name` | string | 名称，最多 100 个字符 |
 | `prefix` | string | 展示用前缀，不包含完整密钥 |
 | `key_hash` | string | 完整密钥的 SHA-256 摘要，64 位十六进制，唯一索引，不通过接口返回 |
+| `scopes` | JSON / text | 权限数组：`read`、`generate`、`write`、`delete`，默认前两项；空权限不自动授权 |
+| `rate_limit` | integer | 每分钟请求上限，1～6000，默认 60 |
+| `request_limit` | bigint / null | 累计请求次数上限，null 表示不限 |
+| `request_count` | bigint | 已计入的累计请求尝试次数 |
+| `rate_window_started_at` | datetime / null | 当前固定 60 秒窗口起点，内部使用 |
+| `rate_window_count` | integer | 当前窗口已计数次数，内部使用 |
 | `expires_at` | datetime / null | 失效时间，`null` 表示永久有效 |
-| `last_used_at` | datetime / null | 最近一次成功认证的时间，未使用时为 `null` |
+| `last_used_at` | datetime / null | 最近一次计入次数的已认证请求尝试，未使用时为 `null` |
 | `created_at` | string | 创建时间，RFC3339 |
 
-密钥使用加密安全随机数生成，以 `ic_` 开头，数据库不保存明文。创建时在事务内锁定所属用户并检查数量，避免并发突破 100 个的限制。每次认证都检查 Key 是否存在、是否过期，以及所属用户的当前状态和角色；Key 不携带权限快照。
+密钥使用加密安全随机数生成，以 `ic_` 开头，数据库不保存明文。创建时在事务内锁定所属用户并检查数量，避免并发突破 100 个的限制。每次认证都检查 Key 是否存在、是否过期，以及所属用户的当前状态和角色；Key 只能在所属用户当前权限内，按自己的 scopes 访问显式开放的业务接口。请求准入在事务锁定当前 Key 后重新检查存在、失效时间、RPM 和累计请求额度并递增，多个进程共用数据库计数。撤销阻止后续准入，不取消已准入请求。
+
+### user_api_key_audit_logs
+
+按 Key 保存的请求审计表。记录 HTTP 状态，不代表业务 code 或异步任务结果。每个用户最多保留最近 10000 条，插入与淘汰在锁定所属用户的事务中完成；查询单 Key 最近 100 条。撤销 Key 后按此上限保留记录，删除所属用户时清理，用户不存在时不再写入在途审计。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 主键 |
+| `key_id` | string | Key ID，索引；不保存密钥内容 |
+| `user_id` | string | 所属用户 ID，索引；查询时按当前用户隔离 |
+| `method` | string | HTTP 方法 |
+| `path` | string | 路由模板，不含查询参数或实际资源 ID |
+| `status` | integer | HTTP 状态 |
+| `duration_ms` | bigint | 耗时毫秒 |
+| `created_at` | string | 开始时间，RFC3339，索引 |
+
+不保存请求头、请求体、完整 Key 或上游密钥。审计写入失败会记录服务端错误，不能把尚未落库的记录视为已保存。
 
 ### user_configs
 

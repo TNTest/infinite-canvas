@@ -200,7 +200,10 @@ func DeleteUser(id string) error {
 		if err := tx.Delete(&model.User{}, "id = ?", id).Error; err != nil {
 			return err
 		}
-		return tx.Delete(&model.UserAPIKey{}, "user_id = ?", id).Error
+		if err := tx.Delete(&model.UserAPIKey{}, "user_id = ?", id).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&model.UserAPIKeyAuditLog{}, "user_id = ?", id).Error
 	})
 }
 

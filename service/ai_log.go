@@ -15,11 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-contrib/sse"
+	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 	"github.com/tigerowo/infinite-canvas/config"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/repository"
-	"github.com/google/uuid"
-	"github.com/robfig/cron/v3"
 )
 
 const (
@@ -398,6 +399,33 @@ func extractAICallFailureReason(raw string, failed *bool) string {
 	if err := json.Unmarshal([]byte(raw), &payload); err == nil {
 		reasons := []string{}
 		collectAICallFailureReasons(payload, &reasons, failed)
+		return strings.Join(dedupeStrings(reasons), "；")
+	}
+	if strings.HasPrefix(raw, "data:") || strings.HasPrefix(raw, "event:") || strings.Contains(raw, "\ndata:") || strings.Contains(raw, "\nevent:") {
+		events, _ := sse.Decode(strings.NewReader(strings.ReplaceAll(raw, "\r\n", "\n")))
+		reasons := []string{}
+		for _, event := range events {
+			data, _ := event.Data.(string)
+			var value struct {
+				Type     string          `json:"type"`
+				Error    json.RawMessage `json:"error"`
+				Response struct {
+					Status string `json:"status"`
+				} `json:"response"`
+			}
+			_ = json.Unmarshal([]byte(data), &value)
+			if event.Event != "error" && event.Event != "response.failed" && (len(value.Error) == 0 || string(value.Error) == "null") && value.Type != "error" && value.Type != "response.failed" && value.Response.Status != "failed" {
+				continue
+			}
+			if failed != nil {
+				*failed = true
+			}
+			reason := extractAICallFailureReason(data, nil)
+			if reason == "" {
+				reason = "AI 响应失败"
+			}
+			reasons = append(reasons, reason)
+		}
 		return strings.Join(dedupeStrings(reasons), "；")
 	}
 	cleaned := cleanPlainLogText(raw)

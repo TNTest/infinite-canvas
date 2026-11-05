@@ -1,19 +1,25 @@
 package handler
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/gin-contrib/sse"
 	"github.com/tigerowo/infinite-canvas/model"
 	"github.com/tigerowo/infinite-canvas/service"
 )
@@ -244,21 +250,31 @@ type aiLogContext struct {
 }
 
 func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.ModelChannel, logContext aiLogContext, onFailure func()) {
+	if onFailure != nil {
+		onFailure = sync.OnceFunc(onFailure)
+	}
 	response, err := service.HTTPClientForChannel(channel).Do(request)
 	if err != nil {
-		log.Printf("AI proxy request failed: url=%s err=%v", request.URL.String(), err)
+		message := redactAIChannelSecret(err.Error(), channel.APIKey)
+		log.Printf("AI proxy request failed: %s", message)
 		if onFailure != nil {
 			onFailure()
 		}
-		saveAIProxyLog(logContext, 0, "", err.Error())
-		Fail(w, "AI 接口请求失败")
+		saveAIProxyLog(logContext, 0, "", message)
+		status := http.StatusBadGateway
+		var networkError net.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
+			status = http.StatusGatewayTimeout
+		}
+		FailWithStatus(w, status, "AI 接口请求失败")
 		return
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= http.StatusBadRequest {
 		payload, _ := io.ReadAll(io.LimitReader(response.Body, 256*1024))
-		log.Printf("AI upstream error: url=%s status=%d body=%s", request.URL.String(), response.StatusCode, strings.TrimSpace(string(payload)))
+		payload = []byte(redactAIChannelSecret(string(payload), channel.APIKey))
+		log.Printf("AI upstream error: status=%d body=%s", response.StatusCode, strings.TrimSpace(string(payload)))
 		if onFailure != nil {
 			onFailure()
 		}
@@ -267,7 +283,16 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.
 		if service.IsTokenDanceChannel(channel) {
 			message = firstNonEmpty(service.TokenDanceRecoveryMessage(response.Header.Get("TokenDance-Recovery-Action")), message)
 		}
-		Fail(w, message)
+		status := response.StatusCode
+		if status == http.StatusUnauthorized || status == http.StatusForbidden || status >= 500 && status != http.StatusGatewayTimeout {
+			status = http.StatusBadGateway
+		}
+		if status == http.StatusTooManyRequests {
+			if retryAfter := response.Header.Get("Retry-After"); validAIRetryAfter(retryAfter) {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+		}
+		FailWithStatus(w, status, message)
 		return
 	}
 
@@ -284,31 +309,168 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, channel model.
 		}
 	}
 	w.WriteHeader(response.StatusCode)
-	responseBody := copyAIResponseBody(w, response.Body, !strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "video/"))
-	saveAIProxyLog(logContext, response.StatusCode, responseBody, "")
-}
-
-func copyAIResponseBody(w http.ResponseWriter, body io.Reader, capture bool) string {
-	flusher, canFlush := w.(http.Flusher)
-	buffer := make([]byte, 32*1024)
-	var logBuffer strings.Builder
-	for {
-		n, err := body.Read(buffer)
-		if n > 0 {
-			if _, writeErr := w.Write(buffer[:n]); writeErr != nil {
-				return logBuffer.String()
-			}
-			if capture && logBuffer.Len() < 64*1024 {
-				_, _ = logBuffer.Write(buffer[:min(n, 64*1024-logBuffer.Len())])
-			}
-			if canFlush {
+	var responseBody string
+	if strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		responseBody, err = copyAIEventStream(w, response.Body, channel.APIKey, 64*1024*1024)
+		if err != nil && !errors.Is(err, errAIClientWrite) && !errors.Is(err, errAIResponseFailure) {
+			// Once streaming begins the HTTP status is committed. Signal the failure
+			// as an SSE event rather than appending a second JSON response.
+			_ = sse.Encode(w, sse.Event{Event: "error", Data: map[string]any{"error": map[string]string{"message": "AI 响应传输中断", "type": "stream_error"}}})
+			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
 			}
 		}
-		if err != nil {
-			return logBuffer.String()
+	} else {
+		responseBody, err = copyAIResponseBody(w, response.Body, !strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "video/"))
+		if err == nil && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "json") && aiResponsePayloadFailed([]byte(responseBody)) {
+			err = errAIResponseFailure
 		}
 	}
+	errorMessage := ""
+	if err != nil {
+		errorMessage = redactAIChannelSecret(err.Error(), channel.APIKey)
+		log.Printf("AI proxy response failed: %s", errorMessage)
+		// A failed client delivery does not prove generation failed. Refunding
+		// on disconnect would let callers consume an upstream result for free.
+		if onFailure != nil && !errors.Is(err, errAIClientWrite) {
+			onFailure()
+		}
+	}
+	saveAIProxyLog(logContext, response.StatusCode, redactAIChannelSecret(responseBody, channel.APIKey), errorMessage)
+}
+
+var (
+	errAIClientWrite     = errors.New("client response write failed")
+	errAIResponseFailure = errors.New("upstream AI response reported failure")
+)
+
+func redactAIChannelSecret(value string, secret string) string {
+	if secret != "" {
+		return strings.ReplaceAll(value, secret, "[redacted]")
+	}
+	return value
+}
+
+func validAIRetryAfter(value string) bool {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		return true
+	}
+	_, err := http.ParseTime(value)
+	return err == nil
+}
+
+func copyAIResponseBody(w http.ResponseWriter, body io.Reader, capture bool) (string, error) {
+	buffer := make([]byte, 32*1024)
+	var logBuffer strings.Builder
+	for {
+		n, readErr := body.Read(buffer)
+		if n > 0 {
+			if err := writeAIResponseChunk(w, buffer[:n], &logBuffer, capture); err != nil {
+				if readErr != nil && !errors.Is(readErr, io.EOF) {
+					err = errors.Join(err, readErr)
+				}
+				return logBuffer.String(), err
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return logBuffer.String(), nil
+			}
+			return logBuffer.String(), readErr
+		}
+	}
+}
+
+func writeAIResponseChunk(w http.ResponseWriter, data []byte, capture *strings.Builder, keep bool) error {
+	n, err := w.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return errors.Join(errAIClientWrite, err)
+	}
+	if keep && capture.Len() < 64*1024 {
+		_, _ = capture.Write(data[:min(n, 64*1024-capture.Len())])
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func copyAIEventStream(w http.ResponseWriter, body io.Reader, secret string, maxFrameBytes int) (string, error) {
+	reader := bufio.NewReader(body)
+	var frame bytes.Buffer
+	var capture strings.Builder
+	writeFrame := func() error {
+		// The existing SSE decoder handles fields, comments and multiline data.
+		// Normalize CRLF only for inspection; successful frames stay byte-for-byte.
+		events, err := sse.Decode(strings.NewReader(strings.ReplaceAll(frame.String(), "\r\n", "\n")))
+		if err != nil {
+			return err
+		}
+		failed := false
+		for _, event := range events {
+			data, _ := event.Data.(string)
+			if event.Event == "error" || event.Event == "response.failed" || aiResponsePayloadFailed([]byte(data)) {
+				failed = true
+			}
+		}
+		data := frame.Bytes()
+		if failed {
+			data = []byte(redactAIChannelSecret(string(data), secret))
+		}
+		if err := writeAIResponseChunk(w, data, &capture, true); err != nil {
+			return err
+		}
+		frame.Reset()
+		if failed {
+			return errAIResponseFailure
+		}
+		return nil
+	}
+	continued := false
+	for {
+		line, err := reader.ReadSlice('\n')
+		if frame.Len()+len(line) > maxFrameBytes {
+			return capture.String(), errors.New("upstream SSE event exceeds size limit")
+		}
+		_, _ = frame.Write(line)
+		if !continued && (bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n"))) {
+			if frameErr := writeFrame(); frameErr != nil {
+				return capture.String(), frameErr
+			}
+		}
+		continued = errors.Is(err, bufio.ErrBufferFull)
+		if continued {
+			continue
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return capture.String(), err
+			}
+			if frame.Len() > 0 {
+				if frameErr := writeFrame(); frameErr != nil {
+					return capture.String(), frameErr
+				}
+			}
+			return capture.String(), nil
+		}
+	}
+}
+
+func aiResponsePayloadFailed(data []byte) bool {
+	var payload struct {
+		Type     string          `json:"type"`
+		Error    json.RawMessage `json:"error"`
+		Response struct {
+			Status string `json:"status"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(data, &payload) != nil {
+		return false
+	}
+	return len(payload.Error) > 0 && string(payload.Error) != "null" || payload.Type == "error" || payload.Type == "response.failed" || payload.Response.Status == "failed"
 }
 
 func saveAIProxyLog(context aiLogContext, status int, responseBody string, errorMessage string) {

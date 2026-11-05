@@ -27,11 +27,12 @@ type apiKeyResponse struct {
 
 type createdAPIKey struct {
 	APIKey struct {
-		ID         string  `json:"id"`
-		Name       string  `json:"name"`
-		Prefix     string  `json:"prefix"`
-		ExpiresAt  *string `json:"expiresAt"`
-		LastUsedAt *string `json:"lastUsedAt"`
+		ID         string   `json:"id"`
+		Name       string   `json:"name"`
+		Prefix     string   `json:"prefix"`
+		ExpiresAt  *string  `json:"expiresAt"`
+		LastUsedAt *string  `json:"lastUsedAt"`
+		Scopes     []string `json:"scopes"`
 	} `json:"apiKey"`
 	Key string `json:"key"`
 }
@@ -93,9 +94,13 @@ func TestAPIKeyRoutes(t *testing.T) {
 		}
 		return token
 	}
-	create := func(token, name string, expiresAt *string) createdAPIKey {
+	create := func(token, name string, expiresAt *string, scopes ...string) createdAPIKey {
 		t.Helper()
-		body, err := json.Marshal(map[string]any{"name": name, "expiresAt": expiresAt})
+		payload := map[string]any{"name": name, "expiresAt": expiresAt, "rateLimit": 1000}
+		if len(scopes) > 0 {
+			payload["scopes"] = scopes
+		}
+		body, err := json.Marshal(payload)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,7 +133,7 @@ func TestAPIKeyRoutes(t *testing.T) {
 			}
 		}
 	})
-	ownerKey := create(ownerJWT, "Permanent automation", nil)
+	ownerKey := create(ownerJWT, "Permanent automation", nil, "read", "generate", "write", "delete")
 	if ownerKey.APIKey.ExpiresAt != nil || ownerKey.APIKey.LastUsedAt != nil {
 		t.Fatal("new permanent key must have null expiration and last-used time")
 	}
@@ -148,7 +153,7 @@ func TestAPIKeyRoutes(t *testing.T) {
 		t.Fatal("database stored the plaintext key")
 	}
 	expiration := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	timedKey := create(ownerJWT, "Timed automation", &expiration)
+	timedKey := create(ownerJWT, "Timed automation", &expiration, "read", "generate", "write", "delete")
 	if timedKey.APIKey.ExpiresAt == nil || *timedKey.APIKey.ExpiresAt != expiration {
 		t.Fatal("expiration was not preserved")
 	}
@@ -173,7 +178,7 @@ func TestAPIKeyRoutes(t *testing.T) {
 		if ownProjects.Code != 0 || !strings.Contains(string(ownProjects.Data), "owner-project") || otherProjects.Code != 0 || strings.Contains(string(otherProjects.Data), "owner-project") {
 			t.Fatal("existing resource ownership was not preserved")
 		}
-		_, list := request(http.MethodGet, "/api/v1/api-keys", ownerKey.Key, "")
+		_, list := request(http.MethodGet, "/api/v1/api-keys", ownerJWT, "")
 		var keys struct {
 			Items []map[string]any `json:"items"`
 			Total int              `json:"total"`
@@ -205,21 +210,43 @@ func TestAPIKeyRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("route scopes and session-only control plane", func(t *testing.T) {
+		keys := map[string]string{}
+		for _, scope := range []string{"read", "generate", "write", "delete"} {
+			keys[scope] = create(ownerJWT, "scope-"+scope, nil, scope).Key
+		}
+		keys["read+write"] = create(ownerJWT, "scope-read-write", nil, "read", "write").Key
+		keys["all"] = ownerKey.Key
+		exerciseAPIKeyRoutePolicy(t, engine, keys, ownerJWT, adminJWT, adminKey.Key, timedKey.Key)
+	})
+
+	t.Run("limits audit and recovery", func(t *testing.T) {
+		exerciseAPIKeyLimitsAndAudit(t, engine, ownerJWT, otherJWT, users[0].ID, db)
+	})
+
 	t.Run("current role controls administrator access", func(t *testing.T) {
 		status, _ := request(http.MethodGet, "/api/admin/users", ownerKey.Key, "")
-		if status != http.StatusUnauthorized {
+		if status != http.StatusForbidden {
 			t.Fatal("ordinary user key gained administrator access")
 		}
 		status, response := request(http.MethodGet, "/api/admin/users", adminKey.Key, "")
+		if status != http.StatusForbidden || response.Code == 0 {
+			t.Fatal("administrator key must not use session-only administrator API")
+		}
+		status, response = request(http.MethodGet, "/api/admin/users", adminJWT, "")
 		if status != http.StatusOK || response.Code != 0 {
-			t.Fatal("administrator key could not use administrator API")
+			t.Fatal("administrator session cannot access control plane")
 		}
 		if err := db.Model(&model.User{}).Where("id = ?", users[2].ID).Update("role", model.UserRoleUser).Error; err != nil {
 			t.Fatal(err)
 		}
 		status, _ = request(http.MethodGet, "/api/admin/users", adminKey.Key, "")
-		if status != http.StatusUnauthorized {
-			t.Fatal("key retained stale administrator role")
+		if status != http.StatusForbidden {
+			t.Fatal("key retained access to session-only administrator API")
+		}
+		status, _ = request(http.MethodGet, "/api/admin/users", adminJWT, "")
+		if status != http.StatusForbidden {
+			t.Fatal("session retained stale administrator role")
 		}
 	})
 
@@ -236,23 +263,33 @@ func TestAPIKeyRoutes(t *testing.T) {
 		if response.Code != 0 {
 			t.Fatal("owner could not revoke key")
 		}
-		status, _ = request(http.MethodGet, "/api/v1/api-keys", ownerKey.Key, "")
+		status, _ = request(http.MethodGet, "/api/v1/canvas/projects", ownerKey.Key, "")
 		if status != http.StatusUnauthorized {
 			t.Fatal("revoked key remained valid")
 		}
 		if err := db.Model(&model.User{}).Where("id = ?", users[1].ID).Update("status", model.UserStatusBan).Error; err != nil {
 			t.Fatal(err)
 		}
-		status, _ = request(http.MethodGet, "/api/v1/api-keys", otherKey.Key, "")
+		status, _ = request(http.MethodGet, "/api/v1/canvas/projects", otherKey.Key, "")
 		if status != http.StatusUnauthorized {
 			t.Fatal("banned user's key remained valid")
 		}
 		if err := repository.DeleteUser(users[2].ID); err != nil {
 			t.Fatal(err)
 		}
-		status, _ = request(http.MethodGet, "/api/v1/api-keys", adminKey.Key, "")
+		status, _ = request(http.MethodGet, "/api/v1/canvas/projects", adminKey.Key, "")
 		if status != http.StatusUnauthorized {
 			t.Fatal("deleted user's key remained valid")
 		}
 	})
+	t.Run("database failure is distinct from invalid credentials", func(t *testing.T) {
+		if err := connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		status, response := request(http.MethodGet, "/api/v1/canvas/projects", otherKey.Key, "")
+		if status != http.StatusServiceUnavailable || response.Code == 0 {
+			t.Fatalf("database outage misreported as invalid key: HTTP %d", status)
+		}
+	})
+
 }

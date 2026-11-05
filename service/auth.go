@@ -219,21 +219,8 @@ func ParseToken(tokenText string) (TokenClaims, error) {
 }
 
 func CurrentAuthUser(tokenText string) (model.AuthUser, bool) {
-	if strings.HasPrefix(tokenText, "ic_") {
-		return currentAPIKeyUser(tokenText)
-	}
-	claims, err := ParseToken(tokenText)
-	if err != nil {
-		return model.AuthUser{}, false
-	}
-	user, ok, err := repository.GetUserByID(claims.UserID)
-	if err != nil || !ok {
-		return model.AuthUser{}, false
-	}
-	if user.Status == model.UserStatusBan {
-		return model.AuthUser{}, false
-	}
-	return model.PublicUser(user), true
+	user, _, err := AuthenticateAccessToken(tokenText)
+	return user, err == nil
 }
 
 func ListUsers(q model.Query) (model.UserList, error) {

@@ -165,6 +165,12 @@ func AuthenticateComfyBridge(token string) (model.ComfyBridge, error) {
 	if err != nil || !bridge.Enabled {
 		return model.ComfyBridge{}, errors.New("Bridge Token 无效")
 	}
+	if bridge.OwnerScope == "personal" {
+		owner, found, err := repository.GetUserByID(bridge.OwnerID)
+		if err != nil || !found || owner.Status != model.UserStatusActive || owner.Role == model.UserRoleGuest {
+			return model.ComfyBridge{}, errors.New("Bridge Token 无效")
+		}
+	}
 	return bridge, nil
 }
 
