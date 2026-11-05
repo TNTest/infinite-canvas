@@ -109,7 +109,7 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/tigerowo/infinite-canvas.git
+git clone https://github.com/TNTest/infinite-canvas.git
 cd infinite-canvas
 cp .env.example .env
 # 修改默认账号密码等信息
@@ -188,6 +188,7 @@ https://infinite-canvas-cpco.onrender.com?apiKey={key}&baseUrl={address}
 - [后端数据库说明](docs/backend/backend-database.md)
 - [系统配置数据结构](docs/backend/system-settings.md)
 - [接口响应约定](docs/backend/api-response.md)
+- [本仓库生产发布](docs/backend/production-deployment.md)
 
 ## 联系方式
 
