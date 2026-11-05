@@ -13,6 +13,7 @@ export type UserAPIKey = {
     rateLimit: number;
     requestLimit: number | null;
     requestCount: number;
+    canCopy: boolean;
 };
 
 export type UserAPIKeyLog = {
@@ -40,4 +41,8 @@ export function deleteUserAPIKey(token: string, id: string) {
 
 export function fetchUserAPIKeyLogs(token: string, id: string) {
     return apiGet<{ items: UserAPIKeyLog[]; total: number }>(`/api/v1/api-keys/${encodeURIComponent(id)}/logs`, undefined, token);
+}
+
+export function revealUserAPIKey(token: string, id: string) {
+    return apiPost<{ key: string }>(`/api/v1/api-keys/${encodeURIComponent(id)}/reveal`, undefined, token);
 }

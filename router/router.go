@@ -44,6 +44,9 @@ func New() *gin.Engine {
 		handler.UserAPIKeyAuditLogs(c.Writer, c.Request, c.Param("id"))
 	})
 	v1.POST("/api-keys", gin.WrapF(handler.CreateUserAPIKey))
+	v1.POST("/api-keys/:id/reveal", func(c *gin.Context) {
+		handler.RevealUserAPIKey(c.Writer, c.Request, c.Param("id"))
+	})
 	v1.DELETE("/api-keys/:id", func(c *gin.Context) {
 		handler.DeleteUserAPIKey(c.Writer, c.Request, c.Param("id"))
 	})

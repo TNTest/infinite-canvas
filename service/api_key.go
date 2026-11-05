@@ -52,6 +52,7 @@ func ListCurrentUserAPIKeys(ctx context.Context) (model.UserAPIKeyList, error) {
 	}
 	keys, err := repository.ListUserAPIKeys(user.ID)
 	for i := range keys {
+		keys[i].CanCopy = keys[i].EncryptedKey != ""
 		if keys[i].Scopes == nil {
 			keys[i].Scopes = []string{}
 		}
@@ -114,6 +115,11 @@ func CreateCurrentUserAPIKey(ctx context.Context, name string, expiresAt *time.T
 		KeyHash: apiKeyHash(key), ExpiresAt: expiresAt, CreatedAt: now(),
 		Scopes: scopes, RateLimit: rateLimit, RequestLimit: requestLimit,
 	}
+	metadata.EncryptedKey, err = encryptAPIKey(key, user.ID, metadata.ID)
+	if err != nil {
+		return model.CreatedUserAPIKey{}, apiKeyCopyUnavailable()
+	}
+	metadata.CanCopy = true
 	if err := repository.CreateUserAPIKey(metadata, MaxUserAPIKeys); err != nil {
 		if errors.Is(err, repository.ErrAPIKeyLimit) {
 			return model.CreatedUserAPIKey{}, safeMessageError{message: "最多可保留 100 个 API Key，请先撤销不再使用的 Key"}
@@ -121,6 +127,40 @@ func CreateCurrentUserAPIKey(ctx context.Context, name string, expiresAt *time.T
 		return model.CreatedUserAPIKey{}, err
 	}
 	return model.CreatedUserAPIKey{APIKey: metadata, Key: key}, nil
+}
+
+func RevealCurrentUserAPIKey(ctx context.Context, id string) (string, error) {
+	started := time.Now()
+	user, err := sessionAPIKeyOwner(ctx)
+	if err != nil {
+		return "", err
+	}
+	key, found, err := repository.GetUserAPIKey(user.ID, id)
+	if err != nil {
+		return "", apiKeyCopyUnavailable()
+	}
+	if !found {
+		return "", &AccessError{Status: http.StatusNotFound, Message: "API Key 不存在"}
+	}
+	if key.EncryptedKey == "" {
+		return "", &AccessError{Status: http.StatusConflict, Message: "此 API Key 未保存可恢复副本，无法复制，请重新创建"}
+	}
+	value, err := decryptAPIKey(key)
+	if err != nil {
+		return "", apiKeyCopyUnavailable()
+	}
+	if err := repository.SaveRequiredUserAPIKeyAuditLog(model.UserAPIKeyAuditLog{
+		ID: newID("key-audit"), KeyID: key.ID, UserID: user.ID,
+		Method: http.MethodPost, Path: "/api/v1/api-keys/:id/reveal", Status: http.StatusOK,
+		DurationMs: time.Since(started).Milliseconds(), CreatedAt: started.UTC().Format("2006-01-02T15:04:05.000000000Z07:00"),
+	}); err != nil {
+		return "", apiKeyCopyUnavailable()
+	}
+	return value, nil
+}
+
+func apiKeyCopyUnavailable() *AccessError {
+	return &AccessError{Status: http.StatusServiceUnavailable, Message: "API Key 复制服务暂时不可用，请稍后重试"}
 }
 
 func DeleteCurrentUserAPIKey(ctx context.Context, id string) error {

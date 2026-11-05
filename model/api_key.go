@@ -2,13 +2,15 @@ package model
 
 import "time"
 
-// UserAPIKey stores only a digest; the original key is returned once on creation.
+// UserAPIKey authenticates by digest and stores an encrypted copy for its owner.
 type UserAPIKey struct {
 	ID                  string     `json:"id" gorm:"primaryKey;size:191"`
 	UserID              string     `json:"-" gorm:"size:191;index"`
 	Name                string     `json:"name" gorm:"size:100"`
 	Prefix              string     `json:"prefix" gorm:"size:16"`
 	KeyHash             string     `json:"-" gorm:"size:64;uniqueIndex"`
+	EncryptedKey        string     `json:"-" gorm:"type:text"`
+	CanCopy             bool       `json:"canCopy" gorm:"-"`
 	ExpiresAt           *time.Time `json:"expiresAt"`
 	LastUsedAt          *time.Time `json:"lastUsedAt"`
 	CreatedAt           string     `json:"createdAt" gorm:"size:64"`

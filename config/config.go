@@ -16,6 +16,7 @@ type Config struct {
 	AdminUsername       string `env:"ADMIN_USERNAME" envDefault:"admin"`
 	AdminPassword       string `env:"ADMIN_PASSWORD" envDefault:"infinite-canvas"`
 	JWTSecret           string `env:"JWT_SECRET" envDefault:"infinite-canvas"`
+	APIKeyEncryptionKey string `env:"API_KEY_ENCRYPTION_KEY"`
 	JWTExpireHours      int    `env:"JWT_EXPIRE_HOURS" envDefault:"168"`
 	StorageDriver       string `env:"STORAGE_DRIVER" envDefault:"sqlite"`
 	DatabaseDSN         string `env:"DATABASE_DSN" envDefault:"data/infinite-canvas.db"`

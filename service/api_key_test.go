@@ -88,7 +88,7 @@ func TestAPIKeyAccessTokens(t *testing.T) {
 		}
 		return
 	}
-	config.Cfg = config.Config{StorageDriver: "sqlite", DatabaseDSN: filepath.Join(t.TempDir(), "access.db"), JWTSecret: "access-test-secret"}
+	config.Cfg = config.Config{StorageDriver: "sqlite", DatabaseDSN: filepath.Join(t.TempDir(), "access.db"), JWTSecret: "access-test-secret", APIKeyEncryptionKey: strings.Repeat("1", 64)}
 	db, err := repository.DB()
 	if err != nil {
 		t.Fatal(err)

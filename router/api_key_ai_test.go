@@ -68,7 +68,7 @@ func TestAPIKeyAIEndToEnd(t *testing.T) {
 		return
 	}
 	previousConfig, previousTransport := config.Cfg, http.DefaultTransport
-	config.Cfg = config.Config{StorageDriver: "sqlite", DatabaseDSN: ":memory:", JWTSecret: "local-key-ai-fixture-secret", AILogDir: t.TempDir()}
+	config.Cfg = config.Config{StorageDriver: "sqlite", DatabaseDSN: ":memory:", JWTSecret: "local-key-ai-fixture-secret", AILogDir: t.TempDir(), APIKeyEncryptionKey: strings.Repeat("1", 64)}
 	t.Cleanup(func() { config.Cfg = previousConfig; http.DefaultTransport = previousTransport })
 	gin.SetMode(gin.TestMode)
 	gin.DefaultWriter = io.Discard

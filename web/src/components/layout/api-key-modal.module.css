@@ -1,0 +1,118 @@
+/* finesse · component: api-key-modal · register=product
+ * states: default · hover · focus-visible · active · disabled · loading · error · success
+ * tokens: inherited (Ant Design / app-theme.ts) */
+.surface {
+    min-width: 0;
+    font-family: inherit;
+}
+
+.surface:global(.ant-modal) :global(.ant-modal-close) {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+}
+.toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+.actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 4px;
+}
+.action {
+    min-height: 44px;
+    min-width: 44px;
+    white-space: nowrap;
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+}
+.action:focus-visible,
+.copyTarget:focus-visible {
+    outline-color: var(--api-key-focus, currentColor);
+    transition: none;
+}
+.action:not(:disabled):active {
+    transform: translateY(1px);
+}
+.action:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.copyTarget {
+    display: inline-flex;
+    cursor: not-allowed;
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+}
+.copyButton {
+    width: 88px;
+    padding-inline: 10px;
+}
+.copySuccess {
+    color: var(--api-key-success);
+    border-color: var(--api-key-success);
+}
+.copyError {
+    color: var(--api-key-error);
+    border-color: var(--api-key-error);
+}
+@media (hover: hover) {
+    .copyButton:not(:disabled):hover {
+        background: var(--api-key-hover);
+    }
+}
+.keyCard {
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+    padding: 14px;
+    border: 1px solid var(--api-key-border);
+    border-radius: var(--api-key-radius);
+    background: var(--api-key-surface);
+}
+.mobileList {
+    display: none;
+}
+
+.surface :global(.ant-input-lg),
+.surface :global(.ant-input-number-lg),
+.surface :global(.ant-picker-large) {
+    min-height: 44px;
+}
+
+.surface :global(.ant-checkbox-wrapper),
+.surface :global(.ant-radio-wrapper) {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+}
+@media (max-width: 767px) {
+    .desktopList {
+        display: none;
+    }
+    .mobileList {
+        display: block;
+    }
+    .action {
+        padding-inline: 10px;
+    }
+
+    .mobileList .actions .action {
+        padding-inline: 4px;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .action {
+        transition: none;
+    }
+    .surface :global(.anticon-loading),
+    .surface :global(.anticon-loading svg) {
+        animation: none;
+    }
+}

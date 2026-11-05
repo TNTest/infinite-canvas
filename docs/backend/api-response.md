@@ -39,7 +39,7 @@ description: 业务接口统一响应结构与前端处理约定
 
 ## 用户 API Key
 
-登录后从账户菜单进入“API Key”。每位用户最多保留 100 个未删除 Key，已过期 Key 也计入；撤销释放名额。密钥使用安全随机数生成，以 `ic_` 开头，数据库只保存 SHA-256 哈希，完整内容仅创建时显示一次。
+登录后从账户菜单进入“API Key”。每位用户最多保留 100 个未删除 Key，已过期 Key 也计入；撤销释放名额。密钥使用安全随机数生成，以 `ic_` 开头。数据库保留用于鉴权的 SHA-256 哈希，并以 AES-256-GCM 加密保存可取回副本；普通列表只返回前缀，登录用户可按需复制自己的完整 Key。
 
 调用支持的业务接口时使用请求头，不能放进 URL：
 
@@ -61,7 +61,7 @@ API Key 使用所属用户的当前身份，同时受 Key 自己的权限范围�
 以下控制面只允许登录会话，Key 即使属于管理员也不能访问：
 
 - `/api/admin/*` 管理后台。
-- `/api/v1/api-keys` 的创建、列表、撤销及调用记录查询；Key 不能派生新 Key。
+- `/api/v1/api-keys` 的创建、列表、复制、撤销及调用记录查询；Key 不能派生新 Key，也不能取回任何完整 Key。
 - `/api/v1/user-config` 及模型、存储配置读写，避免暴露或改写外部凭证。
 - `/api/v1/comfy-bridges` 下的注册、查询、检查和删除。
 - `POST /api/v1/canvas/projects/sync` 全量同步，其响应可能返回全部已有画布；脚本可使用单项目读写接口并配置所需权限。
@@ -81,7 +81,8 @@ Key 可调用的受保护接口由“HTTP 方法 + 路由模板”显式列出�
 以下接口只接受登录会话，只操作当前用户的数据，响应使用 `{ code, data, msg }`，并禁止缓存：
 
 - `GET /api/v1/api-keys`：`data` 为 `{ items, total }`，最多 100 条。
-- `POST /api/v1/api-keys`：请求示例见下文。`expiresAt` 为 `null` 或省略时永久有效，指定时必须为未来 RFC3339 时间。省略 `scopes` 使用默认权限，显式空数组或未知权限会被拒绝。`data` 为 `{ apiKey, key }`，其中 `key` 是唯一一次返回的完整密钥。
+- `POST /api/v1/api-keys`：请求示例见下文。`expiresAt` 为 `null` 或省略时永久有效，指定时必须为未来 RFC3339 时间。省略 `scopes` 使用默认权限，显式空数组或未知权限会被拒绝。`data` 为 `{ apiKey, key }`，其中 `key` 是新创建的完整密钥。
+- `POST /api/v1/api-keys/:id/reveal`：按需取回当前登录用户自己的完整密钥，`data` 为 `{ key }`。必须使用登录会话，API Key 凭证不能调用；已撤销、不存在或他人的 Key 返回 `404`，旧版仅存哈希的 Key 返回 `409` 并提示重建。
 - `DELETE /api/v1/api-keys/:id`：撤销自己的 Key，成功时 `data` 为 `true`。
 - `GET /api/v1/api-keys/:id/logs`：查询自己的 Key 最近 100 条调用记录，`data` 为 `{ items, total }`，`total` 是本次返回条目数。
 
@@ -95,9 +96,21 @@ Key 可调用的受保护接口由“HTTP 方法 + 路由模板”显式列出�
 }
 ```
 
-Key 元数据包含 `id`、`name`、`prefix`、`scopes`、`rateLimit`、`requestLimit`、`requestCount`、`createdAt`、`expiresAt` 和 `lastUsedAt`；时间使用 RFC3339，后两项未设置时为 `null`。接口不返回哈希和完整旧密钥。
+Key 元数据包含 `id`、`name`、`prefix`、`scopes`、`rateLimit`、`requestLimit`、`requestCount`、`createdAt`、`expiresAt`、`lastUsedAt` 和 `canCopy`；时间使用 RFC3339，`expiresAt`、`lastUsedAt` 未设置时为 `null`。列表接口不返回哈希、密文或完整密钥；`canCopy` 表示是否存在可取回的加密副本。
 
 调用记录只保存 Key ID、用户 ID、方法、路由模板、HTTP 状态、耗时和时间，不保存请求头、请求体、查询参数或完整密钥。每用户最多保留最近 10000 条记录，自动淘汰旧记录；每个 Key 的查询界面最多展示其中最近 100 条。HTTP `200` 只代表该 HTTP 状态，仍需检查业务 `code`；任务查询还需检查任务状态。撤销 Key 保留审计记录，删除用户时清理其记录。
+
+### 完整 Key 的加密与复制
+
+服务端须配置独立的 `API_KEY_ENCRYPTION_KEY`：32 字节随机密钥，编码为 64 位十六进制，不与 `JWT_SECRET` 共用。可使用 `openssl rand -hex 32` 生成，在服务器私有环境文件中保存并备份。缺失或格式无效时，新 Key 创建和完整 Key 取回返回 `503`，不会降级保存明文；已有 Key 的哈希鉴权保持原规则。
+
+密文以 `v1:` 标识版本，使用标准库 AES-256-GCM 的随机 nonce，附加认证数据绑定所有者与 Key ID。复制前验证密文完整性、原始 Key 格式和哈希，再写入不含秘密的审计记录；审计保存失败时返回 `503`，不披露明文。复制请求不占用 Key 的调用额度。
+
+刷新或重新登录后可以再次复制新 Key。浏览器只在当前交互中处理明文，不写入持久化 store 或本地业务缓存。自动复制失败时提供临时手动复制入口，关闭后清理。创建和取回完整 Key 的响应使用 `Cache-Control: no-store` 与 `Pragma: no-cache`。
+
+旧版只保存哈希，无法逆向恢复，列表显示不能复制并提示重新创建；升级不会自动替换、撤销或改变旧 Key。已经到期的加密 Key 仍允许所有者取回，但不会因此恢复调用权限。
+
+加密主密钥必须跨重启、升级和回滚保留同值；恢复数据库时也需恢复对应主密钥。直接更换或丢失主密钥会导致既有密文无法取回，本版本不提供自动轮换或恢复机制，哈希鉴权本身不依赖该主密钥。
 
 ### 错误处理
 

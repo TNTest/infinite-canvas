@@ -7,6 +7,7 @@ import (
 
 	"github.com/tigerowo/infinite-canvas/model"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 var ErrAPIKeyLimit = errors.New("API key limit reached")
@@ -14,6 +15,7 @@ var ErrAPIKeyLimit = errors.New("API key limit reached")
 var ErrAPIKeyExpired = errors.New("API key expired")
 var ErrAPIKeyRequestLimit = errors.New("API key request limit reached")
 var ErrAPIKeyPolicy = errors.New("API key policy is invalid")
+var errAPIKeyAuditOwnerMissing = errors.New("API key audit owner no longer exists")
 
 const MaxUserAPIKeyAuditLogs = 10000
 
@@ -38,7 +40,7 @@ func CreateUserAPIKey(key model.UserAPIKey, limit int) error {
 	if err != nil {
 		return err
 	}
-	return db.Transaction(func(tx *gorm.DB) error {
+	return db.Session(&gorm.Session{Logger: logger.Discard}).Transaction(func(tx *gorm.DB) error {
 		// A write to the owner row serializes count + insert across processes and
 		// all supported databases, including MySQL's default REPEATABLE READ.
 		if err := tx.Model(&model.User{}).Where("id = ?", key.UserID).UpdateColumn("id", gorm.Expr("id")).Error; err != nil {
@@ -66,6 +68,19 @@ func GetUserAPIKeyByHash(hash string) (model.UserAPIKey, bool, error) {
 	}
 	var key model.UserAPIKey
 	err = db.Where("key_hash = ?", hash).First(&key).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.UserAPIKey{}, false, nil
+	}
+	return key, err == nil, err
+}
+
+func GetUserAPIKey(userID string, id string) (model.UserAPIKey, bool, error) {
+	db, err := DB()
+	if err != nil {
+		return model.UserAPIKey{}, false, err
+	}
+	var key model.UserAPIKey
+	err = db.Where("user_id = ? AND id = ?", userID, id).First(&key).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return model.UserAPIKey{}, false, nil
 	}
@@ -123,6 +138,15 @@ func DeleteUserAPIKey(userID string, id string) (bool, error) {
 }
 
 func SaveUserAPIKeyAuditLog(log model.UserAPIKeyAuditLog) error {
+	err := SaveRequiredUserAPIKeyAuditLog(log)
+	if errors.Is(err, errAPIKeyAuditOwnerMissing) {
+		return nil
+	}
+	return err
+}
+
+// Sensitive reads must not proceed when their audit record cannot be stored.
+func SaveRequiredUserAPIKeyAuditLog(log model.UserAPIKeyAuditLog) error {
 	db, err := DB()
 	if err != nil {
 		return err
@@ -139,7 +163,7 @@ func saveUserAPIKeyAuditLog(db *gorm.DB, log model.UserAPIKeyAuditLog, limit int
 		var owner model.User
 		if err := tx.Select("id").First(&owner, "id = ?", log.UserID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil
+				return errAPIKeyAuditOwnerMissing
 			}
 			return err
 		}

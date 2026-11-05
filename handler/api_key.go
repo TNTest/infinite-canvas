@@ -21,6 +21,7 @@ func UserAPIKeys(w http.ResponseWriter, r *http.Request) {
 
 func CreateUserAPIKey(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	var request struct {
 		Name      string     `json:"name"`
 		ExpiresAt *time.Time `json:"expiresAt"`
@@ -36,6 +37,17 @@ func CreateUserAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	OK(w, key)
+}
+
+func RevealUserAPIKey(w http.ResponseWriter, r *http.Request, id string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	key, err := service.RevealCurrentUserAPIKey(r.Context(), id)
+	if err != nil {
+		failAPIKeyError(w, err)
+		return
+	}
+	OK(w, map[string]string{"key": key})
 }
 
 func DeleteUserAPIKey(w http.ResponseWriter, r *http.Request, id string) {

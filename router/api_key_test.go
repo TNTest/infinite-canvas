@@ -40,7 +40,7 @@ type createdAPIKey struct {
 func TestAPIKeyRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previous := config.Cfg
-	config.Cfg = config.Config{StorageDriver: "sqlite", DatabaseDSN: filepath.Join(t.TempDir(), "api-keys.db"), JWTSecret: "api-key-route-test-secret"}
+	config.Cfg = config.Config{StorageDriver: "sqlite", DatabaseDSN: filepath.Join(t.TempDir(), "api-keys.db"), JWTSecret: "api-key-route-test-secret", APIKeyEncryptionKey: strings.Repeat("1", 64)}
 	t.Cleanup(func() { config.Cfg = previous })
 	db, err := repository.DB()
 	if err != nil {
