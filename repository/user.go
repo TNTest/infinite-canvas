@@ -196,7 +196,12 @@ func DeleteUser(id string) error {
 	if err != nil {
 		return err
 	}
-	return db.Delete(&model.User{}, "id = ?", id).Error
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&model.User{}, "id = ?", id).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&model.UserAPIKey{}, "user_id = ?", id).Error
+	})
 }
 
 // GetUserByLinuxDoID 根据 Linux.do ID 查询用户。

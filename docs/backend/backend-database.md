@@ -22,6 +22,7 @@ description: 当前后端主要数据表与字段说明
 当前启动时执行 `AutoMigrate`，自动维护以下表：
 
 - `users`
+- `user_api_keys`
 - `credit_logs`
 - `prompts`
 - `agent_skills`
@@ -63,6 +64,23 @@ description: 当前后端主要数据表与字段说明
 | `extra` | json | 扩展信息，第三方资料按平台命名空间保存，如 `linuxDo` |
 | `created_at` | string | 创建时间 |
 | `updated_at` | string | 更新时间 |
+
+### user_api_keys
+
+用户访问密钥表。每位用户最多保留 100 条未删除记录，已过期记录也计入；删除 Key 释放名额，删除用户时同时删除其全部 Key。启动时由 GORM 自动创建表。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 主键 |
+| `user_id` | string | 所属用户 ID，索引，不通过 Key 管理接口返回 |
+| `name` | string | 名称，最多 100 个字符 |
+| `prefix` | string | 展示用前缀，不包含完整密钥 |
+| `key_hash` | string | 完整密钥的 SHA-256 摘要，64 位十六进制，唯一索引，不通过接口返回 |
+| `expires_at` | datetime / null | 失效时间，`null` 表示永久有效 |
+| `last_used_at` | datetime / null | 最近一次成功认证的时间，未使用时为 `null` |
+| `created_at` | string | 创建时间，RFC3339 |
+
+密钥使用加密安全随机数生成，以 `ic_` 开头，数据库不保存明文。创建时在事务内锁定所属用户并检查数量，避免并发突破 100 个的限制。每次认证都检查 Key 是否存在、是否过期，以及所属用户的当前状态和角色；Key 不携带权限快照。
 
 ### user_configs
 

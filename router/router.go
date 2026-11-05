@@ -39,6 +39,11 @@ func New() *gin.Engine {
 		handler.DeleteFile(c.Writer, c.Request, c.Param("id"))
 	})
 	v1 := api.Group("/v1", middleware.UserAuth)
+	v1.GET("/api-keys", gin.WrapF(handler.UserAPIKeys))
+	v1.POST("/api-keys", gin.WrapF(handler.CreateUserAPIKey))
+	v1.DELETE("/api-keys/:id", func(c *gin.Context) {
+		handler.DeleteUserAPIKey(c.Writer, c.Request, c.Param("id"))
+	})
 	v1.POST("/images/generations", gin.WrapF(handler.AIImagesGenerations))
 	v1.POST("/images/edits", gin.WrapF(handler.AIImagesEdits))
 	v1.POST("/responses", gin.WrapF(handler.AIResponses))

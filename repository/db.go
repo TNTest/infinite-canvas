@@ -78,6 +78,7 @@ func DB() (*gorm.DB, error) {
 		}
 		dbErr = db.AutoMigrate(
 			&model.User{},
+			&model.UserAPIKey{},
 			&model.CreditLog{},
 			&model.Prompt{},
 			&model.AgentSkill{},

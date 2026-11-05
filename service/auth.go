@@ -219,6 +219,9 @@ func ParseToken(tokenText string) (TokenClaims, error) {
 }
 
 func CurrentAuthUser(tokenText string) (model.AuthUser, bool) {
+	if strings.HasPrefix(tokenText, "ic_") {
+		return currentAPIKeyUser(tokenText)
+	}
 	claims, err := ParseToken(tokenText)
 	if err != nil {
 		return model.AuthUser{}, false
