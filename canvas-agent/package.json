@@ -5,17 +5,18 @@
     "bin": {
         "canvas-agent": "index.mjs"
     },
-    "files": ["index.mjs", "codex.mjs"],
+    "files": ["index.mjs", "api.mjs", "canvas-operations.js", "browser.mjs", "codex.mjs"],
     "publishConfig": {
         "access": "public"
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/tigerowo/infinite-canvas.git",
+        "url": "git+https://github.com/TNTest/infinite-canvas.git",
         "directory": "canvas-agent"
     },
     "scripts": {
         "start": "node index.mjs",
+        "test": "node --test test/*.test.mjs",
         "codex": "codex"
     },
     "engines": {

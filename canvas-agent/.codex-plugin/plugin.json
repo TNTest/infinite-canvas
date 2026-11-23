@@ -1,7 +1,7 @@
 {
   "name": "canvas-agent",
-  "version": "0.1.0",
-  "description": "通过本地 Canvas Agent 读取和操作当前画布。",
+  "version": "0.1.1",
+  "description": "通过 API Key 或网页连接操作 Infinite Canvas。",
   "author": {
     "name": "Infinite Canvas"
   },
@@ -9,8 +9,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "无限画布",
-    "shortDescription": "使用 Codex 操作当前连接的画布。",
-    "longDescription": "自动启动并连接本地 Agent，通过同一个 MCP 服务调用网页已有画布工具，读取节点、编辑内容并触发生成。",
+    "shortDescription": "使用 Codex 操作已保存或已连接的画布。",
+    "longDescription": "使用项目凭据直接读取画布、编辑节点和管理媒体任务。未配置 Key 时可以连接网页画布。",
     "developerName": "Infinite Canvas",
     "category": "Productivity",
     "capabilities": [
@@ -22,5 +22,5 @@
       "读取当前画布并总结节点结构"
     ]
   },
-  "repository": "https://github.com/tigerowo/infinite-canvas"
+  "repository": "https://github.com/TNTest/infinite-canvas"
 }
