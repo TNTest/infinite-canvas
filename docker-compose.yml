@@ -1,6 +1,6 @@
 services:
   app:
-    image: ghcr.io/tntest/infinite-canvas:v0.8.7
+    image: ghcr.io/tntest/infinite-canvas:v0.8.8
     build:
       context: .
       dockerfile: Dockerfile

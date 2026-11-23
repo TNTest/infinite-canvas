@@ -76,8 +76,15 @@ export default function IndexPage() {
     const pendingAssetCountsRef = useRef<Record<InsertAssetPayload["kind"], number>>({ text: 0, image: 0, video: 0, audio: 0 });
 
     useEffect(() => {
-        void fetchPrompts({ pageSize: 12 })
-            .then((data) => setPromptShowcase(data.items))
+        const pageSize = 12;
+        void fetchPrompts({ category: "xianyu-awesome-gptimage2", pageSize })
+            .catch(() => ({ items: [] }))
+            .then(async ({ items }) => {
+                if (items.length >= pageSize) return items;
+                const fallback = await fetchPrompts({ pageSize });
+                return [...items, ...fallback.items.filter((item) => !items.some(({ id }) => id === item.id))].slice(0, pageSize);
+            })
+            .then(setPromptShowcase)
             .catch((error) => message.error(error instanceof Error ? error.message : "获取提示词失败"));
     }, [message]);
 

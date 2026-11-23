@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.8.8 - 2026-11-23
+
++ [调整] 首页提示词优先展示 Xianyu Awesome GPT Image 2 分类。
+
 ## v0.8.7 - 2026-11-23
 
 + [新增] Canvas Agent 支持项目级启用和用户 API Key，可直接编辑已保存的画布并管理媒体任务。
