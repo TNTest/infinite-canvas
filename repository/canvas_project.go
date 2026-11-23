@@ -9,6 +9,21 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+var ErrCanvasProjectConflict = errors.New("画布版本已更新，请重新读取后再保存")
+
+func GetUserCanvasProject(userID, id string) (model.CanvasProject, error) {
+	var project model.CanvasProject
+	db, err := DB()
+	if err != nil {
+		return project, err
+	}
+	err = db.Where("user_id = ? AND id = ? AND deleted_at = ''", userID, id).Take(&project).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.CanvasProject{}, nil
+	}
+	return project, err
+}
+
 func ListUserCanvasProjects(userID string) ([]model.CanvasProject, error) {
 	db, err := DB()
 	if err != nil {
@@ -25,6 +40,7 @@ func ListUserCanvasProjects(userID string) ([]model.CanvasProject, error) {
 
 func SaveUserCanvasProject(
 	project model.CanvasProject,
+	expectedUpdatedAt string,
 ) (model.CanvasProject, error) {
 	db, err := DB()
 	if err != nil {
@@ -34,47 +50,20 @@ func SaveUserCanvasProject(
 	project.UserID = strings.TrimSpace(project.UserID)
 	project.ID = strings.TrimSpace(project.ID)
 
-	var current model.CanvasProject
-	err = db.First(
-		&current,
-		"user_id = ? AND id = ?",
-		project.UserID,
-		project.ID,
-	).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return project, db.Create(&project).Error
+	var result *gorm.DB
+	if expectedUpdatedAt == "" {
+		result = db.Clauses(clause.OnConflict{DoNothing: true}).Create(&project)
+	} else {
+		result = db.Model(&model.CanvasProject{}).
+			Where("user_id = ? AND id = ? AND deleted_at = '' AND updated_at = ?",
+				project.UserID, project.ID, expectedUpdatedAt).
+			Updates(map[string]any{"project_data": project.ProjectData, "updated_at": project.UpdatedAt})
 	}
-	if err != nil {
-		return project, err
-	}
-	if current.DeletedAt != "" || current.UpdatedAt > project.UpdatedAt {
-		return current, nil
-	}
-
-	result := db.Model(&model.CanvasProject{}).
-		Where(
-			"user_id = ? AND id = ? AND deleted_at = '' AND updated_at <= ?",
-			project.UserID,
-			project.ID,
-			project.UpdatedAt,
-		).
-		Updates(map[string]any{
-			"project_data": project.ProjectData,
-			"updated_at":   project.UpdatedAt,
-		})
 	if result.Error != nil {
 		return project, result.Error
 	}
 	if result.RowsAffected == 0 {
-		if err := db.First(
-			&current,
-			"user_id = ? AND id = ?",
-			project.UserID,
-			project.ID,
-		).Error; err != nil {
-			return project, err
-		}
-		return current, nil
+		return project, ErrCanvasProjectConflict
 	}
 	return project, nil
 }
@@ -85,7 +74,7 @@ func SaveUserCanvasProjects(
 ) ([]model.CanvasProject, error) {
 	for _, project := range projects {
 		project.UserID = userID
-		if _, err := SaveUserCanvasProject(project); err != nil {
+		if _, err := SaveUserCanvasProject(project, ""); err != nil && !errors.Is(err, ErrCanvasProjectConflict) {
 			return nil, err
 		}
 	}

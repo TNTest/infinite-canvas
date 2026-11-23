@@ -26,7 +26,7 @@ codex plugin add canvas-agent@infinite-canvas
 | `infinite_canvas_catalog` | 查询模型渠道、已保存工作流与技能 |
 | `infinite_canvas_media` | 提交、查询、同步或停止媒体任务 |
 
-编辑时指定画布 ID 和最新读取的 `expectedRevision`。浏览器和插件同时保存时仍可能发生竞争。实际生成会使用服务端渠道并可能消耗额度；提交结果不确定时，先按任务 ID 查询。各项操作遵守 Key 的服务端权限。
+编辑时指定画布 ID 和最新读取的 `expectedRevision`。服务端会拒绝基于旧版本的保存。版本冲突时重新读取画布，核对修改是否仍适用。实际生成使用服务端渠道并可能消耗额度。提交结果不确定时先按任务 ID 查询。
 
 ### 仅在一个 Codex 项目中启用
 

@@ -20,6 +20,7 @@ var apiKeyRouteScopes = map[string][]string{
 	"POST /api/v1/workflow-providers/runninghub/inspect": {"read"},
 	"GET /api/v1/workflow-tasks/:id":                     {"read"},
 	"GET /api/v1/canvas/projects":                        {"read"},
+	"GET /api/v1/canvas/projects/:id":                    {"read"},
 	"GET /api/v1/user-data/image-history":                {"read"},
 	"GET /api/v1/generation-logs/videos":                 {"read"},
 	"GET /api/v1/generation-logs/images":                 {"read"},

@@ -94,6 +94,7 @@ export type CanvasNodeMetadata = {
     progress?: number;
     clientTaskId?: string;
     taskBackend?: "account" | "workflow";
+    apiSubmission?: "submitting" | "submitted";
     imageTaskId?: string;
     imageTaskResultId?: string;
     audioTaskId?: string;

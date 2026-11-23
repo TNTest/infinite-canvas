@@ -4,7 +4,7 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
 import { deleteImagePreviews } from "@/services/image-storage";
-import { listCanvasProjects, saveCanvasProject, syncCanvasProjects } from "@/services/api/canvas-tasks";
+import { listCanvasProjects, readCanvasProject, saveCanvasProject, syncCanvasProjects } from "@/services/api/canvas-tasks";
 import { fetchUserConfig } from "@/services/api/user-config";
 import { useUserStore } from "@/stores/use-user-store";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
@@ -23,6 +23,7 @@ export type CanvasProject = {
     title: string;
     createdAt: string;
     updatedAt: string;
+    cloudUpdatedAt?: string;
     nodes: CanvasNodeData[];
     connections: CanvasConnection[];
     chatSessions: CanvasAssistantSession[];
@@ -48,6 +49,10 @@ type CanvasStore = {
     updateProject: (id: string, patch: Partial<Pick<CanvasProject, "nodes" | "connections" | "chatSessions" | "activeChatId" | "agentConfig" | "autoTitlePending" | "backgroundMode" | "showImageInfo" | "viewport" | "sidePanel" | "agentPanel" | "pendingAgentRequest">>) => void;
     syncWithRemote: (token: string, syncEnabled: boolean) => Promise<void>;
     setSyncEnabled: (enabled: boolean) => void;
+    cloudConflicts: Record<string, CanvasProject | null | undefined>;
+    cloudReloads: Record<string, number | undefined>;
+    refreshCloudProject: (id: string, canApply: () => boolean) => Promise<void>;
+    keepDraftAndLoadCloud: (id: string) => Promise<void>;
 };
 
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
@@ -59,6 +64,13 @@ let accountCanvasSyncEnabled = false;
 const projectSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const pendingProjectSaves = new Map<string, { token: string; project: CanvasProject }>();
 const savingProjects = new Set<string>();
+const refreshingProjects = new Set<string>();
+const fromCloud = (project: CanvasProject): CanvasProject => ({ ...project, cloudUpdatedAt: project.updatedAt });
+const hasLocalChanges = (project: CanvasProject) => project.updatedAt !== project.cloudUpdatedAt;
+
+function nextLocalTimestamp(project: CanvasProject) {
+    return new Date(Math.max(Date.now(), (Date.parse(project.updatedAt) || 0) + 1)).toISOString();
+}
 
 function waitForUserStoreHydration() {
     if (useUserStore.persist.hasHydrated()) return Promise.resolve();
@@ -80,12 +92,32 @@ async function flushProjectSave(id: string) {
     if (savingProjects.has(id) || projectSaveTimers.has(id)) return;
     const pending = pendingProjectSaves.get(id);
     pendingProjectSaves.delete(id);
-    if (!pending || !accountCanvasSyncEnabled || useUserStore.getState().token !== pending.token) return;
+    if (!pending || !accountCanvasSyncEnabled || useUserStore.getState().token !== pending.token ||
+        useCanvasStore.getState().cloudConflicts[id] !== undefined) return;
 
     savingProjects.add(id);
-    await saveCanvasProject(pending.token, pending.project).catch(() => undefined);
-    savingProjects.delete(id);
-    void flushProjectSave(id);
+    try {
+        const saved = await saveCanvasProject(pending.token, pending.project);
+        if (useUserStore.getState().token !== pending.token) return;
+        const current = useCanvasStore.getState().openProject(id);
+        if (!current) return;
+        const next = current === pending.project
+            ? { ...current, updatedAt: saved.updatedAt, cloudUpdatedAt: saved.updatedAt }
+            : { ...current, cloudUpdatedAt: saved.updatedAt, updatedAt: nextLocalTimestamp(saved) };
+        useCanvasStore.setState((state) => ({ projects: state.projects.map((project) => project.id === id ? next : project) }));
+        if (current !== pending.project) queueProjectSave(next);
+    } catch (error) {
+        if (error instanceof Error && "status" in error && error.status === 409) {
+            const remote = await readCanvasProject(pending.token, id).then((project) => project ?? null).catch(() => undefined);
+            if (remote !== undefined && useUserStore.getState().token === pending.token && useCanvasStore.getState().openProject(id)) {
+                cancelProjectSaves([id]);
+                useCanvasStore.setState((state) => ({ cloudConflicts: { ...state.cloudConflicts, [id]: remote } }));
+            }
+        }
+    } finally {
+        savingProjects.delete(id);
+        void flushProjectSave(id);
+    }
 }
 
 function queueProjectSave(project: CanvasProject) {
@@ -93,7 +125,7 @@ function queueProjectSave(project: CanvasProject) {
     const previous = projectSaveTimers.get(project.id);
     if (previous) clearTimeout(previous);
     projectSaveTimers.delete(project.id);
-    if (!token || !accountCanvasSyncEnabled) {
+    if (!token || !accountCanvasSyncEnabled || useCanvasStore.getState().cloudConflicts[project.id] !== undefined) {
         pendingProjectSaves.delete(project.id);
         return;
     }
@@ -122,40 +154,12 @@ async function reconcileCanvasProjects(
     remoteProjects: CanvasProject[],
     localProjects: CanvasProject[],
 ) {
-    const remoteById = new Map(
-        remoteProjects.map((project) => [project.id, project]),
-    );
-    const missingProjects = localProjects.filter(
-        (project) => !remoteById.has(project.id),
-    );
-    const existingLocalProjects = localProjects.filter((project) =>
-        remoteById.has(project.id),
-    );
-    const projects = missingProjects.length
-        ? await syncCanvasProjects(token, missingProjects)
-            .then((syncedProjects) =>
-                mergeCanvasProjects(
-                    syncedProjects,
-                    existingLocalProjects,
-                ),
-            )
-            .catch(() =>
-                mergeCanvasProjects(remoteProjects, localProjects),
-            )
-        : mergeCanvasProjects(remoteProjects, existingLocalProjects);
-
-    localProjects.forEach((project) => {
-        const remote = remoteById.get(project.id);
-        if (
-            remote &&
-            Date.parse(project.updatedAt || "") >
-            Date.parse(remote.updatedAt || "")
-        ) {
-            queueProjectSave(project);
-        }
-    });
-
-    return projects;
+    const remoteIds = new Set(remoteProjects.map((project) => project.id));
+    const newProjects = localProjects.filter((project) => !project.cloudUpdatedAt && !remoteIds.has(project.id));
+    if (newProjects.length) {
+        remoteProjects = await syncCanvasProjects(token, newProjects).catch(() => remoteProjects);
+    }
+    return mergeCanvasProjects(remoteProjects, localProjects);
 }
 
 const canvasStorage: PersistStorage<CanvasStore> = {
@@ -204,7 +208,7 @@ const canvasStorage: PersistStorage<CanvasStore> = {
                     remoteProjects.length > 0 &&
                     (accountCanvasSyncEnabled || !localHasData)
                 ) {
-                    const nextState = { projects: remoteProjects };
+                    const nextState = { projects: remoteProjects.map(fromCloud) };
                     const parsed = {
                         state: nextState,
                         version: 0,
@@ -252,6 +256,8 @@ export const useCanvasStore = create<CanvasStore>()(
         (set, get) => ({
             hydrated: false,
             projects: [],
+            cloudConflicts: {},
+            cloudReloads: {},
             createProject: (title = "未命名画布", options) => {
                 const now = new Date().toISOString();
                 const id = nanoid();
@@ -315,7 +321,7 @@ export const useCanvasStore = create<CanvasStore>()(
                     ...project,
                     title: title.trim() || project.title,
                     autoTitlePending: false,
-                    updatedAt: new Date().toISOString(),
+                    updatedAt: nextLocalTimestamp(project),
                 };
                 set((state) => ({
                     projects: state.projects.map((item) =>
@@ -341,11 +347,14 @@ export const useCanvasStore = create<CanvasStore>()(
                 const project = get().projects.find(
                     (item) => item.id === id,
                 );
-                if (!project) return;
+                if (!project || Object.entries(patch).every(([key, value]) => {
+                    const previous = project[key as keyof CanvasProject];
+                    return previous === value || JSON.stringify(previous) === JSON.stringify(value);
+                })) return;
                 const nextProject = {
                     ...project,
                     ...patch,
-                    updatedAt: new Date().toISOString(),
+                    updatedAt: nextLocalTimestamp(project),
                 };
                 set((state) => ({
                     projects: state.projects.map((item) =>
@@ -357,23 +366,31 @@ export const useCanvasStore = create<CanvasStore>()(
             syncWithRemote: async (token, syncEnabled) => {
                 accountCanvasSyncEnabled = syncEnabled;
                 if (!syncEnabled) return;
-                const localProjects = get().projects;
                 const remoteProjects = await listCanvasProjects(token).catch(
                     () => null,
                 );
-                if (!remoteProjects) return;
+                if (!remoteProjects || useUserStore.getState().token !== token) return;
+                const localProjects = get().projects;
                 const projects = await reconcileCanvasProjects(
                     token,
                     remoteProjects,
                     localProjects,
                 );
+                if (get().projects !== localProjects || useUserStore.getState().token !== token) return;
                 if (saveTimer) {
                     clearTimeout(saveTimer);
                     saveTimer = null;
                 }
                 const nextState = { projects };
                 queuedPersistState = nextState;
-                set(nextState);
+                const cloudReloads = { ...get().cloudReloads };
+                for (const project of projects) {
+                    const previous = get().openProject(project.id);
+                    if (previous && previous.updatedAt !== project.updatedAt && !hasLocalChanges(project)) {
+                        cloudReloads[project.id] = (cloudReloads[project.id] ?? 0) + 1;
+                    }
+                }
+                set({ ...nextState, cloudReloads });
                 await localForageStorage.setItem(
                     CANVAS_STORE_KEY,
                     JSON.stringify({ state: nextState, version: 0 }),
@@ -381,6 +398,49 @@ export const useCanvasStore = create<CanvasStore>()(
             },
             setSyncEnabled: (enabled) => {
                 accountCanvasSyncEnabled = enabled;
+            },
+            refreshCloudProject: async (id, canApply) => {
+                const token = useUserStore.getState().token;
+                const current = get().openProject(id);
+                if (!token || !accountCanvasSyncEnabled || !current || refreshingProjects.has(id) ||
+                    savingProjects.has(id) || get().cloudConflicts[id] !== undefined || !canApply()) return;
+                refreshingProjects.add(id);
+                try {
+                    const remote = await readCanvasProject(token, id, current.cloudUpdatedAt);
+                    const latest = get().openProject(id);
+                    if (latest !== current || savingProjects.has(id) || useUserStore.getState().token !== token || !canApply()) return;
+                    if (remote === null || (remote === undefined && !current.cloudUpdatedAt)) {
+                        if (hasLocalChanges(current) && !pendingProjectSaves.has(id)) queueProjectSave(current);
+                        return;
+                    }
+                    if (hasLocalChanges(current)) {
+                        cancelProjectSaves([id]);
+                        set((state) => ({ cloudConflicts: { ...state.cloudConflicts, [id]: remote ?? null } }));
+                    } else {
+                        set((state) => ({
+                            projects: state.projects.flatMap((project) => project.id !== id ? [project] : remote ? [fromCloud(remote)] : []),
+                            cloudReloads: { ...state.cloudReloads, [id]: (state.cloudReloads[id] ?? 0) + 1 },
+                        }));
+                    }
+                } catch {
+                    // Retain the local project while the network is unavailable.
+                } finally {
+                    refreshingProjects.delete(id);
+                }
+            },
+            keepDraftAndLoadCloud: async (id) => {
+                const token = useUserStore.getState().token;
+                const conflict = get().cloudConflicts[id];
+                if (!token || conflict === undefined) return;
+                const remote = await readCanvasProject(token, id).catch(() => conflict);
+                const draft = get().openProject(id);
+                if (!draft || useUserStore.getState().token !== token || get().cloudConflicts[id] !== conflict) return;
+                get().importProject({ ...draft, title: draft.title + "（本地修改副本）" });
+                set((state) => ({
+                    projects: state.projects.flatMap((project) => project.id !== id ? [project] : remote ? [fromCloud(remote)] : []),
+                    cloudConflicts: { ...state.cloudConflicts, [id]: undefined },
+                    cloudReloads: { ...state.cloudReloads, [id]: (state.cloudReloads[id] ?? 0) + 1 },
+                }));
             },
         }),
         {
@@ -401,17 +461,14 @@ export function mergeCanvasProjects(
     remoteProjects: CanvasProject[],
     localProjects: CanvasProject[],
 ): CanvasProject[] {
-    const projects = new Map<string, CanvasProject>();
-    [...localProjects, ...remoteProjects].forEach((project) => {
-        const previous = projects.get(project.id);
-        if (
-            !previous ||
-            Date.parse(project.updatedAt || "") >=
-            Date.parse(previous.updatedAt || "")
-        ) {
-            projects.set(project.id, project);
-        }
-    });
+    const projects = new Map(localProjects.map((project) => [project.id, project]));
+    for (const project of remoteProjects) {
+        const local = projects.get(project.id);
+        const keepDraft = local && (local.cloudUpdatedAt
+            ? hasLocalChanges(local)
+            : Date.parse(local.updatedAt) > Date.parse(project.updatedAt));
+        if (!keepDraft) projects.set(project.id, fromCloud(project));
+    }
     return Array.from(projects.values()).sort(
         (a, b) =>
             Date.parse(b.updatedAt || "") -

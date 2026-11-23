@@ -23,6 +23,12 @@ description: 业务接口统一响应结构与前端处理约定
 
 接口连接失败、服务不可达、返回体不是约定 JSON 时，前端按网络或接口异常处理。
 
+## 画布保存
+
+- `POST /api/v1/canvas/projects` 更新现有画布时，在请求中传入 `expectedUpdatedAt`，取自上次读取或保存响应里的 `updatedAt`。创建新画布时省略该字段。保存成功后使用响应里的新版本。
+- 服务端以当前版本为条件原子写入。版本过期或画布已存在但请求没有版本时，返回 HTTP 409。批量同步接口仅导入缺失的画布。
+- `GET /api/v1/canvas/projects/:id` 可携带 `knownUpdatedAt`。版本相同时返回 `data: null`，有更新时返回画布。画布不存在时返回 HTTP 404。
+
 ## AutoDL 渠道
 
 - `POST /api/ai/autodl/workflows` 使用上述业务响应结构。请求为 `{ baseUrl, workflowId? }`，不传上游 API Key；不带工作流 ID 返回列表，带 ID 返回详情。元数据包含 `uuid`、`name`、`kind` 和详情的 `input_rules`，不返回上游内部节点映射。

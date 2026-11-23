@@ -131,7 +131,7 @@ export function editCanvas(p, args) {
   fail('不支持的节点操作')
 }
 
-/** Each write checks a caller revision and reads back the saved project. Backend has no atomic CAS. */
+/** Writes carry the version read by the caller and are checked atomically by the server. */
 export function createCanvasOperations(api) {
   const locks = new Map()
   const read = async (canvasId) => {
@@ -147,12 +147,10 @@ export function createCanvasOperations(api) {
     try { return await next } finally { if (locks.get(canvasId) === next) locks.delete(canvasId) }
   }
   const save = async (p, expected) => {
-    if (revisionOf(await read(p.id)) !== expected) fail('画布版本冲突，请重新读取后再操作；未覆盖远端修改')
-    p.updatedAt = new Date(Math.max(Date.now(), Date.parse(p.updatedAt) + 1 || 0)).toISOString()
-    const stored = await api({ method: 'POST', path: '/canvas/projects', body: { data: p } })
-    const verified = await read(p.id)
-    if (!stored || revisionOf(stored) !== revisionOf(p) || revisionOf(verified) !== revisionOf(p)) fail('保存回读不一致，可能发生并发修改；请读取核对，不要盲目重试')
-    return summary(verified)
+    const current = await read(p.id)
+    if (revisionOf(current) !== expected) fail('画布版本冲突，请重新读取后再操作')
+    const stored = await api({ method: 'POST', path: '/canvas/projects', body: { data: p, expectedUpdatedAt: current.updatedAt } })
+    return summary(stored)
   }
   const requireRevision = (p, expected) => {
     if (!expected || expected !== revisionOf(p)) fail('缺少或过期的 expectedRevision，请先读取当前画布')
@@ -178,7 +176,7 @@ export function createCanvasOperations(api) {
       }
       requireRevision(p, args.expectedRevision)
       const changed = copy(p), result = editCanvas(changed, args)
-      return { ok: true, ...result, project: await save(changed, args.expectedRevision), consistency: 'read-check-write-read; concurrent browser edits still require coordination' }
+      return { ok: true, ...result, project: await save(changed, args.expectedRevision) }
     }
     return READS.has(args.action) ? run() : exclusive(args.canvasId, run)
   }
@@ -236,7 +234,11 @@ export function createCanvasOperations(api) {
       if (revisionOf(next) !== marker.revision) return { ok: false, error: '任务已提交，但画布发生并发修改，请按 taskId 查询恢复，禁止重发', taskId: task.id ?? clientTaskId }
       const metadata = nodeOf(next, n.id).metadata
       metadata[taskField] = task.id ?? clientTaskId; metadata.apiSubmission = 'submitted'
-      return { ok: true, task, nodeId: n.id, project: await save(next, marker.revision) }
+      try {
+        return { ok: true, task, nodeId: n.id, project: await save(next, marker.revision) }
+      } catch (error) {
+        return { ok: false, error: error.message, taskId: task.id ?? clientTaskId, hint: '任务已提交，请查询原任务并恢复画布关联。' }
+      }
     }
     if (!m[taskField]) fail('节点没有后端任务 ID')
     if (args.action === 'stop') return { ok: true, taskId: m[taskField], data: await api({ method: 'POST', path: '/canvas/tasks/stop', body: { kind, id: m[taskField], workflow: false, source: 'canvas' } }) }

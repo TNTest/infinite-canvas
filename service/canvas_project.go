@@ -17,6 +17,8 @@ type canvasProjectMetadata struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
+var ErrCanvasProjectConflict = repository.ErrCanvasProjectConflict
+
 func canvasProjectFromRaw(
 	userID string,
 	raw json.RawMessage,
@@ -76,6 +78,7 @@ func CurrentUserCanvasProjects(
 func SaveCurrentUserCanvasProject(
 	ctx context.Context,
 	raw json.RawMessage,
+	expectedUpdatedAt string,
 ) (json.RawMessage, error) {
 	user, ok := UserFromContext(ctx)
 	if !ok || user.ID == "" {
@@ -86,14 +89,41 @@ func SaveCurrentUserCanvasProject(
 	if err != nil {
 		return nil, err
 	}
-	saved, err := repository.SaveUserCanvasProject(project)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	if previous, err := time.Parse(time.RFC3339Nano, expectedUpdatedAt); err == nil && !now.After(previous) {
+		now = previous.UTC().Truncate(time.Millisecond).Add(time.Millisecond)
+	}
+	project.UpdatedAt = now.Format("2006-01-02T15:04:05.000Z")
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	fields["updatedAt"], _ = json.Marshal(project.UpdatedAt)
+	data, err := json.Marshal(fields)
 	if err != nil {
 		return nil, err
 	}
-	if saved.DeletedAt != "" {
-		return nil, errors.New("画布项目已删除")
+	project.ProjectData = string(data)
+	saved, err := repository.SaveUserCanvasProject(project, expectedUpdatedAt)
+	if err != nil {
+		return nil, err
 	}
 	return json.RawMessage(saved.ProjectData), nil
+}
+
+func CurrentUserCanvasProject(ctx context.Context, id, knownUpdatedAt string) (json.RawMessage, bool, error) {
+	user, ok := UserFromContext(ctx)
+	if !ok || user.ID == "" {
+		return nil, false, errors.New("请先登录")
+	}
+	project, err := repository.GetUserCanvasProject(user.ID, id)
+	if err != nil || project.ID == "" {
+		return nil, false, err
+	}
+	if project.UpdatedAt == knownUpdatedAt {
+		return nil, true, nil
+	}
+	return json.RawMessage(project.ProjectData), true, nil
 }
 
 func SyncCurrentUserCanvasProjects(

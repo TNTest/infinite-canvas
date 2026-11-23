@@ -6,13 +6,23 @@ export async function listCanvasProjects(token: string) {
     return apiGet<CanvasProject[]>("/api/v1/canvas/projects", undefined, token);
 }
 
+export async function readCanvasProject(token: string, id: string, knownUpdatedAt?: string) {
+    try {
+        return await apiGet<CanvasProject | null>(`/api/v1/canvas/projects/${encodeURIComponent(id)}`, { knownUpdatedAt }, token);
+    } catch (error) {
+        if (error instanceof Error && "status" in error && error.status === 404) return undefined;
+        throw error;
+    }
+}
+
 export async function saveCanvasProject(
     token: string,
     project: CanvasProject,
 ) {
+    const { cloudUpdatedAt, ...data } = project;
     return apiPost<CanvasProject>(
         "/api/v1/canvas/projects",
-        { data: project },
+        { data, expectedUpdatedAt: cloudUpdatedAt },
         token,
     );
 }
@@ -23,7 +33,7 @@ export async function syncCanvasProjects(
 ) {
     return apiPost<CanvasProject[]>(
         "/api/v1/canvas/projects/sync",
-        { projects },
+        { projects: projects.map(({ cloudUpdatedAt: _cloudUpdatedAt, ...project }) => project) },
         token,
     );
 }

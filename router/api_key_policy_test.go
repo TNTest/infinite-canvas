@@ -22,7 +22,7 @@ var expectedScopeRoutes = map[string][]string{
 		"GET /api/v1/canvas/image-tasks/:id", "GET /api/v1/canvas/audio-tasks/:id", "GET /api/v1/video-tasks",
 		"GET /api/v1/videos/:id", "GET /api/v1/videos/:id/content", "GET /api/v1/workflows", "GET /api/v1/agent-skills",
 		"POST /api/v1/storage/measure", "POST /api/v1/workflow-providers/runninghub/inspect", "GET /api/v1/workflow-tasks/:id",
-		"GET /api/v1/canvas/projects", "GET /api/v1/user-data/image-history", "GET /api/v1/generation-logs/videos",
+		"GET /api/v1/canvas/projects", "GET /api/v1/canvas/projects/:id", "GET /api/v1/user-data/image-history", "GET /api/v1/generation-logs/videos",
 		"GET /api/v1/generation-logs/images", "GET /api/v1/user-data/assets",
 	},
 	"generate": {

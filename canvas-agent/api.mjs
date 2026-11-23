@@ -127,7 +127,7 @@ export async function startApiMcp({ site, key }) {
     if (args.action === 'delete') return backend.remove(args)
     throw new Error('不支持的画布操作')
   })
-  register('infinite_canvas_nodes', 'Read and edit saved canvas nodes, connections, groups and layout via backend API. All writes require expectedRevision from a fresh read. There is no browser selection or implicit current canvas. Delete removes graph references but retains media files and backend tasks. Concurrent browser edits are not atomically protected by the current server.', {
+  register('infinite_canvas_nodes', 'Read and edit saved canvas nodes, connections, groups and layout via backend API. All writes require expectedRevision from a fresh read. The server rejects stale project saves. There is no browser selection or implicit current canvas. Delete removes graph references but retains media files and backend tasks.', {
     action: { type: 'string', enum: ['summary', 'query', 'get', 'upstream', 'downstream', 'connected', 'create_text', 'create_primary_script', 'create_media', 'update_text', 'rename', 'move', 'delete', 'connect', 'disconnect', 'group', 'arrange'] },
     canvasId: string, expectedRevision: string, nodeId: string, nodeIds: strings, sourceNodeIds: strings, title: string, projectTitle: string, content: string, prompt: string, keyword: string,
     kind: { type: 'string', enum: ['text', 'image', 'video', 'audio', 'config', 'panorama', 'director', 'group'] },
@@ -141,7 +141,7 @@ export async function startApiMcp({ site, key }) {
     channelId: string, edit: { type: 'boolean' }, request: { type: 'object', additionalProperties: true },
   }, ['action', 'canvasId', 'nodeId'], backend.media)
 
-  const server = new Server({ name: 'infinite-canvas', version: '0.1.1' }, { capabilities: { tools: {} } })
+  const server = new Server({ name: 'infinite-canvas', version: '0.1.4' }, { capabilities: { tools: {} } })
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [...tools.values()].map(tool => tool.definition) }))
   server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
     try {

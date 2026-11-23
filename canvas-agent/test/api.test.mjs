@@ -31,9 +31,15 @@ test('the external MCP uses the key without a browser and keeps API errors in AP
     } else {
       const chunks = []
       for await (const chunk of req) chunks.push(chunk)
-      const { data } = JSON.parse(Buffer.concat(chunks))
-      projects.set(data.id, data)
-      res.end(JSON.stringify({ code: 0, data }))
+      const { data, expectedUpdatedAt } = JSON.parse(Buffer.concat(chunks))
+      const current = projects.get(data.id)
+      if (current && expectedUpdatedAt !== current.updatedAt) {
+        res.writeHead(409).end(JSON.stringify({ code: 1, msg: '画布版本冲突' }))
+        return
+      }
+      const saved = { ...data, updatedAt: new Date(Date.parse(data.updatedAt) + 1).toISOString() }
+      projects.set(data.id, saved)
+      res.end(JSON.stringify({ code: 0, data: saved }))
     }
   })
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))

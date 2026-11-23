@@ -210,6 +210,76 @@ func TestAPIKeyRoutes(t *testing.T) {
 		}
 	})
 
+	t.Run("browser and agent cannot overwrite the same canvas version", func(t *testing.T) {
+		const path = "/api/v1/canvas/projects"
+		const canvas = "/api/v1/canvas/projects/concurrent-canvas"
+		const timestamp = "2026-01-01T00:00:00.000Z"
+		saveBody := func(title, expected string) string {
+			data, err := json.Marshal(map[string]any{
+				"data":              map[string]any{"id": "concurrent-canvas", "createdAt": timestamp, "updatedAt": "2099-01-01T00:00:00.000Z", "title": title},
+				"expectedUpdatedAt": expected,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(data)
+		}
+		type project struct{ Title, UpdatedAt string }
+		decode := func(result apiKeyResponse) project {
+			t.Helper()
+			var value project
+			if result.Code != 0 || json.Unmarshal(result.Data, &value) != nil || value.UpdatedAt == "" {
+				t.Fatalf("invalid canvas response: %+v", result)
+			}
+			return value
+		}
+		_, created := request(http.MethodPost, path, ownerJWT, saveBody("draft", ""))
+		base := decode(created)
+		type attempt struct {
+			status int
+			data   apiKeyResponse
+		}
+		result := make(chan attempt, 2)
+		for index, writer := range []string{ownerJWT, ownerKey.Key} {
+			body := saveBody([]string{"browser", "agent"}[index], base.UpdatedAt)
+			go func() {
+				status, data := request(http.MethodPost, path, writer, body)
+				result <- attempt{status, data}
+			}()
+		}
+		first, second := <-result, <-result
+		if first.status == http.StatusConflict {
+			first, second = second, first
+		}
+		if first.status != http.StatusOK || second.status != http.StatusConflict {
+			t.Fatalf("expected one save and one conflict, got %d and %d", first.status, second.status)
+		}
+		winner := decode(first.data)
+		if winner.UpdatedAt <= base.UpdatedAt {
+			t.Fatal("server did not advance the version")
+		}
+		if status, _ := request(http.MethodPost, path, ownerJWT, saveBody("stale tab", "")); status != http.StatusConflict {
+			t.Fatalf("an old browser without a version must not replace the project: %d", status)
+		}
+		_, imported := request(http.MethodPost, path+"/sync", ownerJWT,
+			`{"projects":[{"id":"concurrent-canvas","createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2099-01-01T00:00:00.000Z","title":"stale import"}]}`)
+		if imported.Code != 0 {
+			t.Fatal("an import of an existing canvas should leave it in place")
+		}
+		_, latest := request(http.MethodGet, canvas, ownerKey.Key, "")
+		if decode(latest) != winner {
+			t.Fatal("a stale save or bulk import changed the winning canvas")
+		}
+		_, unchanged := request(http.MethodGet, canvas+"?knownUpdatedAt="+winner.UpdatedAt, ownerJWT, "")
+		if unchanged.Code != 0 || string(unchanged.Data) != "null" {
+			t.Fatal("conditional read returned an unchanged canvas")
+		}
+		status, hidden := request(http.MethodGet, canvas, otherKey.Key, "")
+		if status != http.StatusNotFound || string(hidden.Data) != "null" {
+			t.Fatal("conditional read exposed another user's canvas")
+		}
+	})
+
 	t.Run("route scopes and session-only control plane", func(t *testing.T) {
 		keys := map[string]string{}
 		for _, scope := range []string{"read", "generate", "write", "delete"} {

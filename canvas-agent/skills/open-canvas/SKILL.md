@@ -7,7 +7,7 @@ description: 通过 API Key 操作已保存的 Infinite Canvas 画布、节点�
 
 ## API Key 模式
 
-当 MCP 提供 `infinite_canvas_status` 时，优先使用后端工具。使用 `infinite_canvas_projects` 确认目标，`infinite_canvas_nodes` 读取或编辑对应的 canvasId。写入使用最新读取的 project.revision 作为 expectedRevision，避免与网页同时保存。
+当 MCP 提供 `infinite_canvas_status` 时，优先使用后端工具。使用 `infinite_canvas_projects` 确认目标，`infinite_canvas_nodes` 读取或编辑对应的 canvasId。写入使用最新读取的 project.revision 作为 expectedRevision。服务端拒绝过期版本，冲突后重新读取并核对修改。
 通过 `infinite_canvas_catalog` 查询模型及渠道。创建媒体节点只准备内容；用户授权生成后，用 `infinite_canvas_media` 提交、查询和同步结果。提交结果不确定时保留原任务 ID，先查询再决定下一步。
 API Key 由运行时读取。401、403 和 429 分别按凭据、权限或额度、请求频率处理，使用 API 模式时无需请求连接浏览器。
 

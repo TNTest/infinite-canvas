@@ -370,10 +370,17 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
     const hydrated = useCanvasStore((state) => state.hydrated);
     const createProject = useCanvasStore((state) => state.createProject);
     const openProject = useCanvasStore((state) => state.openProject);
-    const updateProject = useCanvasStore((state) => state.updateProject);
+    const loadedCloudVersion = useRef<{ id: string; reload: number | undefined } | null>(null);
+    const updateProject = useCallback((...args: Parameters<ReturnType<typeof useCanvasStore.getState>["updateProject"]>) => {
+        const canvas = useCanvasStore.getState();
+        const loaded = loadedCloudVersion.current;
+        if (loaded?.id === args[0] && loaded.reload === canvas.cloudReloads[args[0]]) canvas.updateProject(...args);
+    }, []);
     const renameProject = useCanvasStore((state) => state.renameProject);
     const deleteProjects = useCanvasStore((state) => state.deleteProjects);
     const currentProject = useCanvasStore((state) => state.projects.find((project) => project.id === projectId));
+    const cloudReload = useCanvasStore((state) => state.cloudReloads[projectId]);
+    const hasCloudConflict = useCanvasStore((state) => state.cloudConflicts[projectId] !== undefined);
     const colorTheme = useThemeStore((state) => state.theme);
     const theme = canvasThemes[colorTheme];
     const [nodes, setNodes] = useState<CanvasNodeData[]>([]);
@@ -615,6 +622,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
     useEffect(() => {
         if (!hydrated) return;
+        let cancelled = false;
         setProjectLoaded(false);
         setInitialAgentRequest(null);
         setReferencePickerNodeId(null);
@@ -643,6 +651,8 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                 }),
             );
             const restoredNodes = await hydrateCanvasImages(resetNodes);
+            if (cancelled) return;
+            loadedCloudVersion.current = { id: projectId, reload: cloudReload };
             for (const node of restoredNodes) {
                 const id = node.metadata?.clientTaskId;
                 if (!id) continue;
@@ -678,7 +688,29 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             setProjectLoaded(true);
         };
         void restore();
-    }, [hydrated, openProject, projectId, router]);
+        return () => { cancelled = true; };
+    }, [cloudReload, hydrated, openProject, projectId, router]);
+
+    useEffect(() => {
+        if (!projectLoaded) return;
+        let cancelled = false;
+        const canApply = () => !cancelled && !document.hidden &&
+            !nodeDraggingRef.current && !dragRef.current.isDraggingNode &&
+            !document.activeElement?.closest("input, textarea, [contenteditable=true]") &&
+            !nodesRef.current.some((node) => !node.metadata?.apiSubmission && (
+                node.metadata?.status === NODE_STATUS_LOADING || node.metadata?.status === "stopping"
+            ));
+        const refresh = () => { void useCanvasStore.getState().refreshCloudProject(projectId, canApply); };
+        const timer = window.setInterval(refresh, 5000);
+        window.addEventListener("focus", refresh);
+        document.addEventListener("visibilitychange", refresh);
+        return () => {
+            cancelled = true;
+            window.clearInterval(timer);
+            window.removeEventListener("focus", refresh);
+            document.removeEventListener("visibilitychange", refresh);
+        };
+    }, [projectId, projectLoaded]);
 
     useEffect(() => {
         if (!projectLoaded) return;
@@ -747,7 +779,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         if (!projectLoaded) return;
         const pollCanvasTasks = () => {
             nodesRef.current.filter((node) => node.metadata?.status === "stopping" && !node.metadata.errorDetails).forEach((node) => { void handleStopNode(node.id); });
-            const videoTargets = nodesRef.current.filter((node) => node.type === CanvasNodeType.Video && node.metadata?.status === NODE_STATUS_LOADING && !node.metadata.content && canvasVideoTaskId(node.metadata));
+            const videoTargets = nodesRef.current.filter((node) => node.type === CanvasNodeType.Video && node.metadata?.status === NODE_STATUS_LOADING && !node.metadata.apiSubmission && !node.metadata.content && canvasVideoTaskId(node.metadata));
             videoTargets.forEach((node) => {
                 if (pollingVideoNodeIdsRef.current.has(node.id)) return;
                 const taskId = canvasVideoTaskId(node.metadata);
@@ -770,7 +802,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         pollingVideoNodeIdsRef.current.delete(node.id);
                     });
             });
-            const imageTargets = nodesRef.current.filter((node) => isCanvasImageNodeType(node.type) && node.metadata?.status === NODE_STATUS_LOADING && !node.metadata.content && node.metadata.imageTaskId);
+            const imageTargets = nodesRef.current.filter((node) => isCanvasImageNodeType(node.type) && node.metadata?.status === NODE_STATUS_LOADING && !node.metadata.apiSubmission && !node.metadata.content && node.metadata.imageTaskId);
             imageTargets.forEach((node) => {
                 if (pollingImageNodeIdsRef.current.has(node.id) || !node.metadata?.imageTaskId) return;
                 const workflowToken = node.metadata.workflowRef ? useUserStore.getState().token : "";
@@ -791,7 +823,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         pollingImageNodeIdsRef.current.delete(node.id);
                     });
             });
-            const audioTargets = nodesRef.current.filter((node) => node.type === CanvasNodeType.Audio && node.metadata?.status === NODE_STATUS_LOADING && !node.metadata.content && node.metadata.audioTaskId);
+            const audioTargets = nodesRef.current.filter((node) => node.type === CanvasNodeType.Audio && node.metadata?.status === NODE_STATUS_LOADING && !node.metadata.apiSubmission && !node.metadata.content && node.metadata.audioTaskId);
             audioTargets.forEach((node) => {
                 if (pollingAudioNodeIdsRef.current.has(node.id) || !node.metadata?.audioTaskId) return;
                 const workflowToken = node.metadata.workflowRef ? useUserStore.getState().token : "";
@@ -4506,6 +4538,14 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                 onInsertAsset={handleAssetInsert}
             />
             <section className="relative min-w-0 flex-1 overflow-hidden">
+                {hasCloudConflict && (
+                    <div role="status" className="absolute left-1/2 top-14 z-40 flex max-w-[calc(100%-2rem)] -translate-x-1/2 flex-wrap items-center gap-x-3 gap-y-1 rounded-md px-3 py-2 text-sm" style={{ background: theme.toolbar.panel, color: theme.toolbar.activeText }}>
+                        <span>云端画布已更新。本地修改已保留，云端同步已暂停。</span>
+                        <button type="button" className="font-medium underline underline-offset-2" onClick={() => void useCanvasStore.getState().keepDraftAndLoadCloud(projectId)}>
+                            另存本地修改并加载云端
+                        </button>
+                    </div>
+                )}
                 <CanvasTopBar
                     title={currentProject?.title || "未命名画布"}
                     sidePanelOpen={sidePanel.open}
