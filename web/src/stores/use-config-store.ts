@@ -61,6 +61,7 @@ export type AiConfig = {
     miniMaxTtsFormat: string;
     miniMaxTtsSpeed: string;
     videoSeconds: string;
+    videoSecondsExplicit?: boolean;
     videoMode: string;
     videoNegativePrompt: string;
     videoMultiShot: string;
@@ -199,18 +200,18 @@ type ConfigStore = {
     clearPromptContinue: () => void;
 };
 
-function resolveEffectiveConfig(config: AiConfig, modelChannel: AdminPublicSettings["modelChannel"] | null, canUseRemoteChannel: boolean) {
+export function resolveEffectiveConfig(config: AiConfig, modelChannel: AdminPublicSettings["modelChannel"] | null, canUseRemoteChannel: boolean) {
     const channelMode = canUseRemoteChannel ? (modelChannel?.allowCustomChannel ? config.channelMode : "remote") : "local";
     if (channelMode === "local" || !modelChannel) {
         const localChannels = normalizeLocalChannels(config);
         const modelChannels = localChannels.filter((channel) => !isWorkflowProtocol(channel.protocol));
-        return {
+        return applyVideoDurationDefault({
             ...config,
             channelMode,
             localChannels,
             models: normalizeModelList(modelChannels.flatMap((channel) => channel.models)),
             publicChannels: modelChannel?.channels || [],
-        };
+        });
     }
     const models = modelChannel.availableModels;
     const textModels = filterChannelModelsByCapability(modelChannel.channels, "text", models);
@@ -222,7 +223,7 @@ function resolveEffectiveConfig(config: AiConfig, modelChannel: AdminPublicSetti
     const fallbackImageModel = validDefault(modelChannel.defaultImageModel, imageModels) || preferredModel(imageModels, isImageModelName) || imageModels[0] || "";
     const fallbackVideoModel = validDefault(modelChannel.defaultVideoModel, videoModels) || preferredModel(videoModels, isVideoModelName) || videoModels[0] || "";
     const fallbackAudioModel = preferredModel(audioModels, isAudioModelName) || audioModels[0] || "";
-    return {
+    return applyVideoDurationDefault({
         ...config,
         channelMode,
         models,
@@ -238,7 +239,16 @@ function resolveEffectiveConfig(config: AiConfig, modelChannel: AdminPublicSetti
         systemPrompt: "",
         systemPrompts: { ...defaultConfig.systemPrompts, ...(modelChannel.systemPrompts || {}) },
         publicChannels: modelChannel.channels || [],
-    };
+    });
+}
+
+function applyVideoDurationDefault(config: AiConfig): AiConfig {
+    const model = config.videoModel;
+    const usesDefault = !config.videoSeconds || (!config.videoSecondsExplicit && config.videoSeconds === defaultConfig.videoSeconds);
+    if (usesDefault && model.trim().toLowerCase() === "minimax-h3" && channelProtocolForConfig({ ...config, model }) === "minimax") {
+        return { ...config, videoSeconds: "5" };
+    }
+    return config;
 }
 
 function validDefault(model: string, models: string[]) {
@@ -406,6 +416,7 @@ export const useConfigStore = create<ConfigStore>()(
                     config: {
                         ...state.config,
                         [key]: value,
+                        ...(key === "videoSeconds" ? { videoSecondsExplicit: true } : {}),
                     },
                 })),
             loadPublicSettings: async () => {
