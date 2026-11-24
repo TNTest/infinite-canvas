@@ -73,6 +73,10 @@ func exerciseAPIKeyRoutePolicy(t *testing.T, actual *gin.Engine, keys map[string
 		id := route.Method + " " + route.Path
 		requiredScope := expected[id]
 		sessionOnly := admin || strings.HasPrefix(route.Path, "/api/v1/api-keys") || strings.HasPrefix(route.Path, "/api/v1/user-config") || strings.HasPrefix(route.Path, "/api/v1/comfy-bridges") || route.Path == "/api/v1/canvas/projects/sync"
+		switch id {
+		case "POST /api/v1/canvas/video-analysis", "POST /api/v1/canvas/video-analysis/:id/frames", "DELETE /api/v1/canvas/video-analysis/:id":
+			sessionOnly = true
+		}
 		if !sessionOnly && requiredScope == "" {
 			t.Fatalf("unreviewed protected route: %s", id)
 		}

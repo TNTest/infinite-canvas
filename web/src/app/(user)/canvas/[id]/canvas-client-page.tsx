@@ -38,7 +38,7 @@ import {
     type CanvasAlignmentGuides,
 } from "../utils/canvas-alignment";
 import { App, Button, Dropdown, Modal, Slider } from "antd";
-import { isCogVideoX3Model, modelKey, supportsVideoAudioGeneration, supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
+import { isCogVideoX3Model, modelKey, supportsVideoFrameReferences } from "@/lib/video-model-capabilities";
 import { isMimoVoiceCloneModel } from "@/lib/mimo-tts";
 import { isAutoDLConfig } from "@/lib/autodl";
 import { isGlmTtsModel } from "@/lib/audio-generation";
@@ -104,6 +104,7 @@ import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 const CanvasPanoramaViewer = dynamic(() => import("../components/canvas-panorama-viewer"), { ssr: false, loading: () => null });
 
 type CanvasClipboard = {
+    token: string;
     nodes: CanvasNodeData[];
     connections: CanvasConnection[];
 };
@@ -132,6 +133,7 @@ type CanvasHistoryEntry = Pick<CanvasClipboard, "nodes" | "connections"> & {
     showImageInfo: boolean;
 };
 
+const CANVAS_CLIPBOARD_TYPE = "application/x-infinite-canvas-nodes";
 const VIDEO_NODE_MAX_WIDTH = 420;
 const VIDEO_NODE_MAX_HEIGHT = 420;
 const CONNECTION_HANDLE_HIT_RADIUS = 40;
@@ -1465,9 +1467,9 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         return group.id;
     }, []);
 
-    const copySelectedNodes = useCallback(() => {
+    const copySelectedNodes = useCallback((event: ClipboardEvent) => {
         const selectedIds = selectedNodeIdsRef.current;
-        if (!selectedIds.size) return;
+        if (!selectedIds.size || !event.clipboardData) return;
 
         const copiedIds = new Set(selectedIds);
         nodesRef.current.forEach((node) => {
@@ -1487,7 +1489,11 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
         if (!copiedNodes.length) return;
 
+        const token = nanoid();
+        event.clipboardData.setData(CANVAS_CLIPBOARD_TYPE, token);
+        event.preventDefault();
         clipboardRef.current = {
+            token,
             nodes: copiedNodes,
             connections: connectionsRef.current.filter((connection) => copiedIds.has(connection.fromNodeId) && copiedIds.has(connection.toNodeId)).map((connection) => ({ ...connection })),
         };
@@ -1970,7 +1976,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         setDialogNodeId(id);
     }, []);
 
-    const createImageFileNode = useCallback(async (file: File, position: Position, choosePanoramaImport = false) => {
+    const createImageFileNode = useCallback(async (file: File, position: Position, choosePanoramaImport = false, successMessage?: string) => {
         const hideLoading = message.loading("正在上传图片...", 0);
         try {
             const image = await uploadImage(file);
@@ -1979,6 +1985,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                 return;
             }
             appendImportedImageNode(image, file.name, position, CanvasNodeType.Image);
+            if (successMessage) message.success(successMessage);
         } catch (error) {
             console.error("Upload image node failed:", error);
             message.error("图片上传失败");
@@ -2118,31 +2125,64 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
         [getCanvasCenter],
     );
 
-    const pasteSystemClipboard = useCallback(async () => {
-        if (!navigator.clipboard) return;
+    const pasteSystemClipboard = useCallback(async (data: DataTransfer) => {
+        let files = Array.from(data.files);
+        const text = data.getData("text/plain");
+        if (data.types.some((type) => type.startsWith("image/")) && navigator.clipboard?.read) {
+            try {
+                const items = await navigator.clipboard.read();
+                const imageItem = items.find((item) => item.types.some((type) => type.startsWith("image/")));
+                const imageType = imageItem?.types.find((type) => type.startsWith("image/"));
+                if (imageItem && imageType) {
+                    const blob = await imageItem.getType(imageType);
+                    files = [new File([blob], "clipboard-image.png", { type: imageType })];
+                }
+            } catch {
+                if (!files.length && !text.trim()) {
+                    message.warning("读取剪贴板图片失败");
+                    return;
+                }
+            }
+        }
 
-        const items = await navigator.clipboard.read();
-        const imageItem = items.find((item) => item.types.some((type) => type.startsWith("image/")));
-        if (imageItem) {
-            const imageType = imageItem.types.find((type) => type.startsWith("image/"));
-            if (!imageType) return;
-            const blob = await imageItem.getType(imageType);
-            const file = new File([blob], "clipboard-image.png", { type: imageType });
-            void createImageFileNode(file, getCanvasCenter());
-            message.success("已从剪切板添加图片");
+        const mediaFiles = files.filter((file) => file.size > 0 && (file.type.startsWith("image/") || file.type.startsWith("video/")));
+        if (mediaFiles.length !== files.length) message.warning("仅支持粘贴非空的图片和视频文件");
+        if (mediaFiles.length) {
+            const center = getCanvasCenter();
+            mediaFiles.forEach((file, index) => {
+                const position = { x: center.x + index * 48, y: center.y + index * 48 };
+                if (file.type.startsWith("video/")) void createVideoFileNode(file, position);
+                else void createImageFileNode(file, position, false, "已从剪切板添加图片");
+            });
             return;
         }
 
-        const text = await navigator.clipboard.readText();
         if (createTextNodeFromClipboard(text)) message.success("已从剪切板添加文本");
-    }, [createImageFileNode, createTextNodeFromClipboard, getCanvasCenter, message]);
+        else if (!files.length) message.warning("剪贴板中没有可粘贴的文本、图片或视频");
+    }, [createImageFileNode, createTextNodeFromClipboard, createVideoFileNode, getCanvasCenter, message]);
 
     useEffect(() => {
-        const handleKeyDown = (event: KeyboardEvent) => {
-            const target = event.target instanceof Element ? event.target : null;
+        const handleShortcut = (event: KeyboardEvent | ClipboardEvent) => {
+            const isClipboard = event instanceof ClipboardEvent;
+            const eventTarget = isClipboard ? document.activeElement : event.target;
+            const target = eventTarget instanceof Element ? eventTarget : null;
             const targetNodeId = target?.closest<HTMLElement>("[data-node-id]")?.dataset.nodeId;
-            const isSelectedVideo = event.target instanceof HTMLVideoElement && Boolean(targetNodeId && selectedNodeIdsRef.current.has(targetNodeId));
-            if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement || target?.closest("[contenteditable='true']") || (target?.closest("[data-canvas-no-zoom]") && !isSelectedVideo)) return;
+            const isSelectedVideo = target instanceof HTMLVideoElement && Boolean(targetNodeId && selectedNodeIdsRef.current.has(targetNodeId));
+            if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target?.closest("[contenteditable='true']") || (target?.closest("[data-canvas-no-zoom]") && !isSelectedVideo)) return;
+
+            if (isClipboard) {
+                const data = event.clipboardData;
+                if (event.defaultPrevented || !data) return;
+                if (event.type === "copy") {
+                    const selection = window.getSelection();
+                    if (selection && !selection.isCollapsed && selection.toString()) return;
+                    copySelectedNodes(event);
+                    return;
+                }
+                event.preventDefault();
+                if (data.getData(CANVAS_CLIPBOARD_TYPE) !== clipboardRef.current?.token || !pasteCopiedNodes()) void pasteSystemClipboard(data);
+                return;
+            }
 
             const key = event.key.toLowerCase();
             const isModifierShortcut = event.metaKey || event.ctrlKey;
@@ -2175,21 +2215,6 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                 return;
             }
 
-            if (isModifierShortcut && !event.altKey && key === "c") {
-                const selection = window.getSelection();
-                if (selection && !selection.isCollapsed && selection.toString()) return;
-
-                event.preventDefault();
-                copySelectedNodes();
-                return;
-            }
-
-            if (isModifierShortcut && !event.altKey && key === "v") {
-                event.preventDefault();
-                if (!pasteCopiedNodes()) void pasteSystemClipboard();
-                return;
-            }
-
             if (event.key === "Delete" || event.key === "Backspace") {
                 if (selectedNodeIdsRef.current.size) {
                     deleteNodes(new Set(selectedNodeIdsRef.current));
@@ -2215,8 +2240,9 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             }
         };
 
-        window.addEventListener("keydown", handleKeyDown);
-        return () => window.removeEventListener("keydown", handleKeyDown);
+        const shortcutEvents = ["keydown", "copy", "paste"] as const;
+        shortcutEvents.forEach((type) => window.addEventListener(type, handleShortcut));
+        return () => shortcutEvents.forEach((type) => window.removeEventListener(type, handleShortcut));
     }, [copySelectedNodes, createGroupFromSelection, deleteConnection, deleteNodes, pasteCopiedNodes, pasteSystemClipboard, redoCanvas, selectedConnectionId, setConnecting, undoCanvas]);
 
     const handleConnectStart = useCallback(
@@ -3174,9 +3200,10 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
     }, []);
 
     const handleGenerateNode = useCallback(
-        async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string) => {
+        async (nodeId: string, mode: CanvasNodeGenerationMode, prompt: string, draftTaskId?: string, retry = false) => {
             const sourceNode = nodesRef.current.find((node) => node.id === nodeId);
             const generationConfig = buildGenerationConfig(effectiveConfig, sourceNode, mode);
+            if (draftTaskId) Object.assign(generationConfig, { videoMode: "normal", vquality: "1080p" });
             const workflowRef = mode === "text" ? undefined : sourceNode?.metadata?.workflowRef;
             if (workflowRef && !useUserStore.getState().token) {
                 message.error("工作流生成需要先登录");
@@ -3187,7 +3214,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                 return;
             }
 
-            const overwriteExisting = effectiveConfig.nodeRegenerateBehavior === "overwrite" && sourceNode?.type === mode && !sourceNode.metadata?.isBatchRoot
+            const overwriteExisting = (retry || effectiveConfig.nodeRegenerateBehavior === "overwrite") && sourceNode?.type === mode && !sourceNode.metadata?.isBatchRoot
                 && Boolean(sourceNode.metadata?.content || sourceNode.metadata?.clientTaskId)
                 && (mode !== "image" || workflowRef || !isKIESeedreamLayerDecompositionModel(generationConfig.model));
             const runningRequest = Symbol();
@@ -3200,7 +3227,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             }
             const sourceTextContent = sourceNode?.type === CanvasNodeType.Text ? sourceNode.metadata?.content?.trim() || "" : "";
             const editingTextNode = mode === "text" && Boolean(sourceTextContent) && !overwriteExisting;
-            const generationContext = await hydrateNodeGenerationContext(
+            const generationContext = draftTaskId ? buildNodeGenerationContext(nodeId, [], [], prompt) : await hydrateNodeGenerationContext(
                 buildNodeGenerationContext(nodeId, nodesRef.current, connectionsRef.current, editingTextNode ? `请根据要求修改以下文本。\n\n原文：\n${sourceTextContent}\n\n修改要求：\n${prompt}` : prompt),
             );
             const effectivePrompt = generationContext.prompt.trim();
@@ -3614,7 +3641,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         position: isEmptyVideoNode ? sourceNode.position : { x: parent.x + (sourceNode?.width || spec.width) + 96, y: parent.y },
                         width: isEmptyVideoNode ? sourceNode.width : spec.width,
                         height: isEmptyVideoNode ? sourceNode.height : spec.height,
-                        metadata: { prompt: effectivePrompt, cameraControl: sourceNode?.metadata?.cameraControl, status: NODE_STATUS_LOADING, model: videoGenerationConfig.model, channelId: videoGenerationConfig.videoChannelId || videoGenerationConfig.activeChannelId, workflowRef, size: videoGenerationConfig.size, seconds: videoGenerationConfig.videoSeconds, vquality: videoGenerationConfig.vquality, mode: videoGenerationConfig.videoMode, negativePrompt: videoGenerationConfig.videoNegativePrompt, multiShot: videoGenerationConfig.videoMultiShot, shotType: videoGenerationConfig.videoShotType, generateAudio: videoGenerationConfig.videoGenerateAudio, characterOrientation: videoGenerationConfig.videoCharacterOrientation, watermark: videoGenerationConfig.videoWatermark, references: generationReferenceUrls({ ...generationContext, referenceImages: videoReferenceImages, firstFrame, lastFrame }), firstFrameNodeId: sourceNode?.metadata?.firstFrameNodeId, lastFrameNodeId: sourceNode?.metadata?.lastFrameNodeId, klingImageNodeIds: sourceNode?.metadata?.klingImageNodeIds, klingMultiPrompt: sourceNode?.metadata?.klingMultiPrompt, klingElementList: sourceNode?.metadata?.klingElementList, startedAt: generationStartedAt, progress: 0, clientTaskId, videoTaskId: clientTaskId },
+                        metadata: { prompt: effectivePrompt, cameraControl: sourceNode?.metadata?.cameraControl, status: NODE_STATUS_LOADING, model: videoGenerationConfig.model, channelId: videoGenerationConfig.videoChannelId || videoGenerationConfig.activeChannelId, workflowRef, size: videoGenerationConfig.size, seconds: videoGenerationConfig.videoSeconds, vquality: videoGenerationConfig.vquality, mode: videoGenerationConfig.videoMode, negativePrompt: videoGenerationConfig.videoNegativePrompt, multiShot: videoGenerationConfig.videoMultiShot, shotType: videoGenerationConfig.videoShotType, generateAudio: videoGenerationConfig.videoGenerateAudio, characterOrientation: videoGenerationConfig.videoCharacterOrientation, watermark: videoGenerationConfig.videoWatermark, references: generationReferenceUrls({ ...generationContext, referenceImages: videoReferenceImages, firstFrame, lastFrame }), firstFrameNodeId: sourceNode?.metadata?.firstFrameNodeId, lastFrameNodeId: sourceNode?.metadata?.lastFrameNodeId, klingImageNodeIds: sourceNode?.metadata?.klingImageNodeIds, klingMultiPrompt: sourceNode?.metadata?.klingMultiPrompt, klingElementList: sourceNode?.metadata?.klingElementList, startedAt: generationStartedAt, progress: 0, clientTaskId, videoTaskId: clientTaskId, videoDraft: videoGenerationConfig.videoMode === "draft", videoDraftTaskId: draftTaskId },
                     };
                     pendingChildIds = [videoId];
                     setNodes((prev) => (isEmptyVideoNode ? prev.map((node) => (node.id === nodeId ? { ...node, ...videoNode, ...(overwriteExisting ? { position: node.position, width: node.width, height: node.height, metadata: { ...node.metadata, ...videoNode.metadata, taskBackend: undefined, videoTaskVideoId: undefined, videoTaskTranslation: undefined } } : {}) } : node)) : [...prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: NODE_STATUS_SUCCESS } } : node)), videoNode]));
@@ -3622,7 +3649,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                     submittedTask = { nodeId: videoId, id: clientTaskId };
                     const videoTask = await submitNodeTask(videoId, clientTaskId, async (signal, onServerTask) => workflowRef
                         ? await workflowVideoTask(await submitCanvasWorkflowTask(workflowRef, videoGenerationConfig, "video", requestPrompt, [firstFrame, ...videoReferenceImages, lastFrame].filter((image): image is ReferenceImage => Boolean(image)), generationContext.referenceVideos, generationContext.referenceAudios, videoId, projectId, clientTaskId, () => onServerTask("workflow"), signal))
-                        : (await createVideoGenerationTask(videoGenerationConfig, requestPrompt, { references: videoReferenceImages, firstFrame, lastFrame, videoReferences: generationContext.referenceVideos, audioReferences: generationContext.referenceAudios }, undefined, { signal, onServerTask, clientTaskId, source: "canvas", sourceId: videoId })).task, overwriteExisting ? runningRequest : undefined);
+                        : (await createVideoGenerationTask(videoGenerationConfig, requestPrompt, { references: videoReferenceImages, firstFrame, lastFrame, videoReferences: generationContext.referenceVideos, audioReferences: generationContext.referenceAudios }, undefined, { signal, onServerTask, clientTaskId, source: "canvas", sourceId: videoId, draftTaskId })).task, overwriteExisting ? runningRequest : undefined);
                     if (!isNodeTaskActive(videoId, clientTaskId)) return;
                     setNodes((prev) => applyCanvasVideoTaskUpdate(prev, videoId, videoTask, videoGenerationConfig, generationStartedAt, spec, clientTaskId));
                     return;
@@ -3896,7 +3923,6 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         imageCount: 1,
                         videoSeconds: agentEffectiveConfig.videoSeconds,
                         videoGenerateAudio: agentEffectiveConfig.videoGenerateAudio,
-                        videoSupportsAudio: supportsVideoAudioGeneration(videoModel),
                         videoDuration: canvasAgentVideoDurationHint(videoModel),
                         audioVoice: isGeminiTtsModel(audioModel) && isGeminiConfig(audioConfig, audioModel) ? agentEffectiveConfig.geminiTtsVoice : miniMaxTts ? agentEffectiveConfig.miniMaxTtsVoice : isGlmTtsModel(audioModel) ? agentEffectiveConfig.glmTtsVoice : grokTts ? agentEffectiveConfig.grokTtsVoice : agentEffectiveConfig.audioVoice,
                         audioLanguage: grokTts ? agentEffectiveConfig.grokTtsLanguage : "",
@@ -4120,12 +4146,8 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                         const seconds = typeof args.seconds === "number" ? args.seconds : Number(generationConfig.videoSeconds);
                         const durationError = agentWorkflowRef ? "" : validateCanvasAgentVideoSeconds(generationConfig.model, seconds);
                         if (durationError) return { ok: false, code: "unsupported_duration", message: durationError, supported: canvasAgentVideoDurationHint(generationConfig.model) };
-                        const generateAudio = typeof args.generateAudio === "boolean" ? args.generateAudio : generationConfig.videoGenerateAudio === "true";
-                        if (!agentWorkflowRef && generateAudio && !supportsVideoAudioGeneration(generationConfig.model)) {
-                            return { ok: false, code: "video_audio_not_supported", message: "当前全局视频模型不支持视频原生声音" };
-                        }
                         metadata.seconds = String(seconds);
-                        metadata.generateAudio = String(generateAudio);
+                        if (typeof args.generateAudio === "boolean") metadata.generateAudio = String(args.generateAudio);
                     }
                     if (mode === "audio") {
                         if (isGeminiTtsModel(generationConfig.model) && isGeminiConfig(generationConfig, generationConfig.model)) {
@@ -4150,7 +4172,10 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                     }
 
                     const layoutSourceNodes = mode === "image" ? [] : mode === "video" ? nodesRef.current.filter((node) => !node.metadata?.groupId && (node.type === CanvasNodeType.Text || isCanvasImageNodeType(node.type) || node.type === CanvasNodeType.Group)) : sourceNodes;
-                    let node = createCanvasNode(targetType, nextNodeCenter(targetType, layoutSourceNodes), metadata);
+                    const videoSize = mode === "video" && typeof generationConfig.size === "string"
+                        ? nodeSizeFromRatio(generationConfig.size, VIDEO_NODE_MAX_WIDTH, VIDEO_NODE_MAX_HEIGHT) ?? undefined
+                        : undefined;
+                    let node = createCanvasNode(targetType, nextNodeCenter(targetType, layoutSourceNodes, videoSize), metadata);
                     if (mode === "video") node = applyNodeConfigPatch(node, { size: generationConfig.size });
                     node.title = stringValue("title") || prompt.slice(0, 32) || (mode === "video" ? "视频" : mode === "audio" ? "音频" : "图片");
                     const createdConnections = sourceNodeIds.map((sourceNodeId) => ({ id: nanoid(), fromNodeId: sourceNodeId, toNodeId: node.id }));
@@ -4210,6 +4235,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
 
     const handleRetryNode = useCallback(
         async (node: CanvasNodeData) => {
+            if (node.type === CanvasNodeType.Video && !node.metadata?.videoDraft && node.metadata?.videoDraftTaskId) return handleGenerateNode(node.id, "video", node.metadata.prompt || "", node.metadata.videoDraftTaskId, true);
             const sourceNode = findRetrySourceNode(node.id, nodesRef.current, connectionsRef.current) || node;
             const retryWorkflowRef = node.metadata?.workflowRef;
             const batchPrimaryId = retryWorkflowRef && isCanvasImageNodeType(node.type) && node.metadata?.isBatchRoot ? node.metadata.primaryImageId : undefined;
@@ -4272,7 +4298,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
             setNodes((prev) => prev.map((item) => {
                 const isRetryTarget = item.id === retryTargetId;
                 if (!isRetryTarget && !(retryMirrorsRoot && item.id === retryBatchRootId)) return item;
-                return { ...item, metadata: { ...item.metadata, clientTaskId: isRetryTarget ? retryClientTaskId || undefined : undefined, taskBackend: undefined, status: NODE_STATUS_LOADING, errorDetails: undefined, content: undefined, storageKey: "", progress: 0, startedAt: retryStartedAt, ...(item.type === CanvasNodeType.Video ? { videoTaskId: retryVideoTaskId, videoTaskVideoId: undefined, videoTaskTranslation: undefined } : {}), ...(isCanvasImageNodeType(item.type) ? { imageTaskId: isRetryTarget || retryMirrorsRoot && !retryWorkflowRef ? retryImageTaskId : undefined, imageTaskResultId: undefined } : {}), ...(item.type === CanvasNodeType.Audio ? { audioTaskId: retryAudioTaskId, audioTaskResultId: undefined } : {}) } };
+                return { ...item, metadata: { ...item.metadata, clientTaskId: isRetryTarget ? retryClientTaskId || undefined : undefined, taskBackend: undefined, status: NODE_STATUS_LOADING, errorDetails: undefined, content: undefined, storageKey: "", progress: 0, startedAt: retryStartedAt, ...(item.type === CanvasNodeType.Video ? { mode: generationConfig.videoMode, videoDraft: generationConfig.videoMode === "draft", videoDraftTaskId: undefined, videoTaskId: retryVideoTaskId, videoTaskVideoId: undefined, videoTaskTranslation: undefined } : {}), ...(isCanvasImageNodeType(item.type) ? { imageTaskId: isRetryTarget || retryMirrorsRoot && !retryWorkflowRef ? retryImageTaskId : undefined, imageTaskResultId: undefined } : {}), ...(item.type === CanvasNodeType.Audio ? { audioTaskId: retryAudioTaskId, audioTaskResultId: undefined } : {}) } };
             }));
 
             try {
@@ -4357,7 +4383,7 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                 if (runningRequestRef.current === runningRequest) setRunningNodeId(null);
             }
         },
-        [effectiveConfig, message, openConfigDialog, projectId, isNodeTaskActive, submitNodeTask],
+        [effectiveConfig, message, openConfigDialog, projectId, isNodeTaskActive, submitNodeTask, handleGenerateNode],
     );
 
     const generateImageFromTextNode = useCallback(
@@ -4720,6 +4746,8 @@ function InfiniteCanvasPage({ projectId }: { projectId: string }) {
                             onToggleBatch={toggleBatchExpanded}
                             onSetBatchPrimary={setBatchPrimary}
                             onRetry={(node) => void handleRetryNode(node)}
+                            onConvertDraft={node.type === CanvasNodeType.Video && node.metadata?.videoDraft && node.metadata?.status === NODE_STATUS_SUCCESS && node.metadata?.videoDraftTaskId ? (node) => handleGenerateNode(node.id, "video", node.metadata?.prompt || "", node.metadata?.videoDraftTaskId) : undefined}
+                            isConvertingDraft={Boolean(node.metadata?.videoDraft && node.metadata.videoDraftTaskId && nodes.some((item) => item.type === CanvasNodeType.Video && !item.metadata?.videoDraft && item.metadata?.videoDraftTaskId === node.metadata?.videoDraftTaskId && (item.metadata?.status === NODE_STATUS_LOADING || item.metadata?.status === "stopping")))}
                             onViewImage={(node) => setPreviewNodeId(node.id)}
                             onSelectReference={selectNodeReference}
                             onContextMenu={(event, id) => {
@@ -5749,6 +5777,8 @@ function applyCanvasVideoTaskUpdate(nodes: CanvasNodeData[], nodeId: string, tas
         const completed = canvasVideoTaskCompleted(task);
         const failed = canvasVideoTaskFailed(task) || (completed && !url);
         const taskStartedAt = parseCanvasVideoTaskTime(task.started_at ?? task.startedAt ?? task.created_at ?? task.createdAt) || startedAt;
+        const modelId = modelKey(task.model || config.model);
+        const draft = !node.metadata?.workflowRef && (task.draft ?? (node.metadata?.videoDraft === true && (modelId.includes("seedance-2-5") || modelId.includes("seedance2-5") || modelId.includes("sd2-5"))));
         const metadata: CanvasNodeMetadata = {
             ...node.metadata,
             status: failed ? NODE_STATUS_ERROR : completed ? NODE_STATUS_SUCCESS : NODE_STATUS_LOADING,
@@ -5766,6 +5796,8 @@ function applyCanvasVideoTaskUpdate(nodes: CanvasNodeData[], nodeId: string, tas
             durationMs: Date.now() - taskStartedAt,
             progress,
             videoTaskId: task.task_id || task.id || node.metadata?.videoTaskId,
+            videoDraft: draft,
+            videoDraftTaskId: task.draft_task_id || (draft && !task.parameter_translation ? task.task_id || task.id : undefined) || node.metadata?.videoDraftTaskId,
             videoTaskVideoId: task.video_id || node.metadata?.videoTaskVideoId,
             videoTaskTranslation: task.translationSnapshot,
         };

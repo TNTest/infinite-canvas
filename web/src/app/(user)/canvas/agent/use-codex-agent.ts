@@ -22,6 +22,7 @@ type ActiveRun = {
     input: RunInput; state: CanvasAgentState; threadId?: string; turnId?: string;
     buffer: CodexRpcEvent[]; messages: Map<string, string>; finished: boolean; controller: AbortController;
     finish: (error?: Error) => void;
+    streamedReasoning: Set<string>; reasoningPart?: string;
 };
 const CONNECTION_KEY = "canvas-codex-connection";
 const defaultConnection = { endpoint: "http://127.0.0.1:3210", token: "" };
@@ -31,6 +32,7 @@ const stopped = () => new DOMException("Agent 已停止", "AbortError");
 export function useCodexAgent(options: {
     canvasId: string;
     executeTool: (action: CanvasAgentAction, signal: AbortSignal) => Promise<CanvasAgentToolResult>;
+    readVideo: (nodeId: string, signal: AbortSignal) => Promise<Blob | string>;
     onApproval: (request: CodexRpcEvent, signal: AbortSignal) => Promise<unknown>;
     onBootstrap: () => void;
 }) {
@@ -165,7 +167,30 @@ export function useCodexAgent(options: {
                 return;
             }
             if (!belongs) return;
-            if (event.method === "item/agentMessage/delta" && params.itemId) {
+            if (event.method === "thread/tokenUsage/updated" && params.tokenUsage) {
+                try {
+                    const { last, modelContextWindow } = params.tokenUsage;
+                    if (last && Number.isFinite(last.totalTokens) && last.totalTokens >= 0) {
+                        pending.input.onContextUsage?.({ tokens: last.totalTokens, contextWindow: modelContextWindow, threadId: params.threadId });
+                    }
+                } catch { /* 用量展示不影响 Codex 执行 */ }
+            } else if ((event.method === "item/reasoning/summaryTextDelta" || event.method === "item/reasoning/textDelta") &&
+                params.itemId && params.delta) {
+                const source = event.method === "item/reasoning/summaryTextDelta" ? "summary" : "content";
+                const part = `${params.itemId}:${source}:${params.summaryIndex ?? params.contentIndex ?? 0}`;
+                pending.input.onReasoning?.((pending.reasoningPart && pending.reasoningPart !== part ? "\n\n" : "") + params.delta);
+                pending.streamedReasoning.add(part);
+                pending.reasoningPart = part;
+            } else if (event.method === "item/completed" && params.item?.type === "reasoning") {
+                const { id, summary, content } = params.item;
+                const reasoning = [
+                    ...(summary || []).filter((_, index) => !pending.streamedReasoning.delete(`${id}:summary:${index}`)),
+                    ...(content || []).filter((_, index) => !pending.streamedReasoning.delete(`${id}:content:${index}`)),
+                ].filter(Boolean).join("\n\n");
+                if (pending.reasoningPart) pending.input.onReasoning?.("\n\n");
+                if (reasoning) pending.input.onReasoning?.(reasoning + "\n\n");
+                pending.reasoningPart = undefined;
+            } else if (event.method === "item/agentMessage/delta" && params.itemId) {
                 pending.messages.set(params.itemId, (pending.messages.get(params.itemId) || "") + (params.delta || ""));
                 pending.input.onText([...pending.messages.values()].join("\n\n"));
             } else if (event.method === "item/completed" && params.item?.type === "agentMessage") {
@@ -176,7 +201,7 @@ export function useCodexAgent(options: {
                 pending.finish(turn.status === "failed" ? new Error(turn.error?.message || "Codex 执行失败")
                     : turn.status === "interrupted" ? stopped() : undefined);
             } else if (event.method === "item/started") {
-                pending.input.onEvent?.({ status: "running", label: "Codex 正在处理" });
+                pending.input.onEvent?.({ status: "running", label: "" });
             }
         };
         dispatch.current = handleRpc;
@@ -189,6 +214,12 @@ export function useCodexAgent(options: {
                 try {
                     signal.throwIfAborted();
                     if (client.current !== link || (event.source === "codex" && !pending)) throw stopped();
+                    if (event.name === "extract_video_frames") {
+                        const nodeId = typeof event.arguments.nodeId === "string" ? event.arguments.nodeId : "";
+                        const video = await latest.current.readVideo(nodeId, signal);
+                        if (!(await link.uploadVideo(event.requestId, video, signal)).ok) throw new Error("无法将视频交给本地 Agent");
+                        return;
+                    }
                     const action = normalizeCanvasAgentAction(event.name, event.arguments, event.requestId);
                     let result: CanvasAgentToolResult;
                     if (pending && action.name === "arrange_nodes" && !canvasAgentAllowsArrangement(pending.input.userText)) {
@@ -253,6 +284,7 @@ export function useCodexAgent(options: {
             const pending: ActiveRun = {
                 input, state: input.initialState, threadId,
                 buffer: [], messages: new Map(), finished: false, controller: new AbortController(),
+                streamedReasoning: new Set(),
                 finish: (reason) => {
                     if (pending.finished) return;
                     pending.finished = true;
@@ -275,13 +307,16 @@ export function useCodexAgent(options: {
                 if (pending.finished) return;
                 pending.threadId = thread.id;
                 input.onThread(thread.id, link.serviceId);
-                input.onEvent?.({ status: "thinking", label: "Codex 正在理解画布和创作目标" });
+                input.onEvent?.({ status: "thinking", label: "" });
                 const references = input.references.map((item) => (item.label || item.title) + " → 节点 " + item.id + "（" + item.title + "）").join("；");
                 const images = input.references.filter((item) => item.dataUrl && /^(data:image\/|https?:\/\/)/.test(item.dataUrl));
                 const imageOrder = images.map((item, index) => "第 " + (index + 1) + " 张 = " + (item.label || item.title)).join("；");
-                const text = input.userText + (references ? "\n本次引用：" + references : "") + (imageOrder ? "\n附图顺序：" + imageOrder : "");
+                const text = input.userText
+                    + (skills && input.skillsSelected ? "\n\n【本轮用户明确选择的 Skill，替换此前选择】\n" + skills : "")
+                    + (references ? "\n本次引用：" + references : "") + (imageOrder ? "\n附图顺序：" + imageOrder : "");
                 const { turn } = await link.rpc<{ turn: { id: string } }>("turn/start", {
                     threadId: thread.id,
+                    summary: "auto",
                     input: [{ type: "text", text }, ...images.map((item) => ({ type: "image", url: item.dataUrl }))],
                     ...(input.model ? { model: input.model } : {}), ...(input.effort ? { effort: input.effort } : {}),
                 });

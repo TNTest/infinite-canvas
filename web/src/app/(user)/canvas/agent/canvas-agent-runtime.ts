@@ -9,6 +9,7 @@ import {
 import type { AiConfig } from "@/stores/use-config-store";
 import type {
     CanvasAgentContent,
+    CanvasAgentContextUsage,
     CanvasAgentJsonFallbackMode,
     CanvasAgentProtocolMessage,
     CanvasAgentState,
@@ -16,17 +17,18 @@ import type {
     CanvasAssistantMessageStatus,
     CanvasAssistantReference,
 } from "../types";
-import type { CanvasAgentContext } from "./canvas-agent-context";
+import { serializeCanvasAgentContext, type CanvasAgentContext } from "./canvas-agent-context";
 import { buildCanvasAgentSkillPrompt } from "./canvas-agent-skills";
 import {
     compactCanvasAgentHistory,
     estimateCanvasAgentInputTokens,
-    MAX_AGENT_INPUT_TOKENS,
+    canvasAgentInputBudget,
     serializeCanvasAgentMessagesForCheckpoint,
 } from "./canvas-agent-memory";
 import {
     CANVAS_AGENT_SKILL_FILE_TOOL,
     CANVAS_AGENT_TOOLS,
+    CANVAS_AGENT_VIDEO_TOOL,
     canvasAgentActionLabel,
     isCanvasAgentMediaAction,
     normalizeCanvasAgentAction,
@@ -49,12 +51,17 @@ export type RunCanvasAgentInput = {
     protocolMessages: CanvasAgentProtocolMessage[];
     userText: string;
     references: CanvasAssistantReference[];
+    skillsSelected?: boolean;
     activeSkillContents?: Array<{ id: string; source: "system" | "user"; name: string; content: string; hasFiles?: boolean }>;
+    enableVideoAnalysis?: boolean;
     contextCheckpoint?: string;
     preferredJsonMode?: CanvasAgentJsonFallbackMode;
     getContext: (state: CanvasAgentState) => CanvasAgentContext;
     executeAction: (action: CanvasAgentAction, signal?: AbortSignal) => Promise<CanvasAgentToolResult>;
     onEvent?: (event: CanvasAgentRuntimeEvent) => void;
+    onReasoning?: (delta: string) => void;
+    onText?: (text: string) => void;
+    onContextUsage?: (usage: CanvasAgentContextUsage) => void;
     onCheckpoint?: (checkpoint: {
         state: CanvasAgentState;
         protocolMessages: CanvasAgentProtocolMessage[];
@@ -83,20 +90,25 @@ export function createCanvasAgentState(): CanvasAgentState {
 }
 
 export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCanvasAgentResult> {
+    const maxInputTokens = canvasAgentInputBudget(input.config.textModel || input.config.model);
     let state = input.initialState;
     let toolMode: CanvasAgentToolMode = input.preferredJsonMode || "native";
     let usedJsonFallbackMode = input.preferredJsonMode;
     let hasExecutedActions = false;
     let protocolError: string | undefined;
     let expectedAction = false;
-    let protocolMessages: CanvasAgentProtocolMessage[] = [
-        ...input.protocolMessages,
-        { role: "user" as const, content: buildUserContent(input.userText, input.references, input.config.textModel || input.config.model) },
-    ];
+    const selectedSkills = input.skillsSelected ? input.activeSkillContents?.map((skill) => skill.name).join("、") : "";
+    const requestText = input.userText + (selectedSkills
+        ? "\n\n【本条消息引用的 Skill】\n" + selectedSkills
+            + "\n用户已通过输入框选择并激活以上 Skill，正文已在系统指令中提供。本条没有具体需求时，只简短确认已加载；有具体需求时，直接按所选 Skill 执行该需求，不额外回复加载确认。无需让用户重新选择这些 Skill。"
+        : "");
+    let currentUserMessage: CanvasAgentProtocolMessage = { role: "user", content: buildUserContent(requestText, input.references, input.config.textModel || input.config.model) };
+    let protocolMessages = [...input.protocolMessages, currentUserMessage];
     let contextCheckpoint = input.contextCheckpoint;
     const activeSkillContents = input.activeSkillContents?.map((skill, index) => `【完整 Skill ${index + 1}：${skill.name}（${skill.source === "system" ? `系统 Skill ID：${skill.id}` : "用户 Skill"}）】\n${skill.content}`).join("\n\n");
     const skillFileToolAvailable = Boolean(input.activeSkillContents?.some((skill) => skill.source === "system" && skill.hasFiles));
-    const agentTools = skillFileToolAvailable ? [...CANVAS_AGENT_TOOLS, CANVAS_AGENT_SKILL_FILE_TOOL] : CANVAS_AGENT_TOOLS;
+    let agentTools = skillFileToolAvailable ? [...CANVAS_AGENT_TOOLS, CANVAS_AGENT_SKILL_FILE_TOOL] : CANVAS_AGENT_TOOLS;
+    if (input.enableVideoAnalysis) agentTools = [...agentTools, CANVAS_AGENT_VIDEO_TOOL];
 
     const emitCheckpoint = () => input.onCheckpoint?.({
         state,
@@ -105,50 +117,85 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         jsonFallbackMode: usedJsonFallbackMode,
     });
 
-    const compactHistory = async () => {
+    const compactHistory = async (currentRoundOnly = false) => {
         const compacted = await compactCanvasAgentHistory({
             protocolMessages,
             contextCheckpoint,
+            currentUserMessage,
+            currentRoundOnly,
             createCheckpoint: (previousCheckpoint, messages) => requestCanvasAgentCheckpoint({
                 config: input.config,
                 previousCheckpoint,
-                messages: serializeCanvasAgentMessagesForCheckpoint(messages),
+                messages: serializeCanvasAgentMessagesForCheckpoint(messages, currentRoundOnly),
+                currentRound: currentRoundOnly ? input.userText : undefined,
                 signal: input.signal,
             }),
         });
         if (!compacted.compacted) return false;
+        if (compacted.currentUserMessage) currentUserMessage = compacted.currentUserMessage;
         protocolMessages = compacted.protocolMessages;
         contextCheckpoint = compacted.contextCheckpoint;
         emitCheckpoint();
         return true;
     };
 
+    const compactForRequest = async () => {
+        try {
+            if (await compactHistory()) return true;
+        } catch (error) {
+            if (!isCanvasAgentContextLimitError(error) || !(await compactHistory(true))) throw error;
+            return true;
+        }
+        return compactHistory(true);
+    };
+
     for (let step = 0; step < MAX_AGENT_STEPS; step++) {
         throwIfAborted(input.signal);
-        input.onEvent?.({ status: "thinking", label: step ? "正在根据画布结果继续" : "正在理解画布和创作目标" });
+        input.onEvent?.({ status: "thinking", label: step ? "正在根据画布结果继续" : "" });
         const context = input.getContext(state);
-        let systemPrompt = buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable);
+        const canvasContext = serializeCanvasAgentContext(context);
+        const buildPrompt = () => buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable, false)
+            + (input.enableVideoAnalysis
+                ? "\n\n用户要求看懂视频画面时，对引用的真实节点调用 analyze_video。"
+                    + "已有 Skill 可以传真实节点 ID。只把视频用于生成参考时使用原有生成工具。"
+                    + "后续动作依赖视频观察时，先单独调用 analyze_video，等结果返回后再调用对应工具。"
+                : "");
+        let systemPrompt = buildPrompt();
         const nativeTools = toolMode === "native";
         const tools = nativeTools ? agentTools : [];
-        if (estimateCanvasAgentInputTokens({ systemPrompt: canvasAgentSystemPrompt(input.config, systemPrompt, nativeTools ? [] : agentTools, nativeTools), messages: protocolMessages, tools }, canvasAgentTokenCalibrationKey(input.config)) >= MAX_AGENT_INPUT_TOKENS) {
-            if (await compactHistory()) systemPrompt = buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable);
+        const overBudget = () => estimateCanvasAgentInputTokens({ systemPrompt: canvasAgentSystemPrompt(input.config, systemPrompt + "\n\n【当前真实画布上下文 JSON】\n" + canvasContext, nativeTools ? [] : agentTools, nativeTools), messages: protocolMessages, tools }, canvasAgentTokenCalibrationKey(input.config)) >= maxInputTokens * 0.9;
+        if (overBudget() && await compactForRequest()) {
+            systemPrompt = buildPrompt();
+            while (overBudget()) {
+                if (!(await compactHistory(true))) break;
+            }
         }
 
         const requestTurn = () => requestCanvasAgentTurn({
             config: input.config,
             systemPrompt,
+            canvasContext,
             messages: protocolMessages,
             tools: agentTools,
             toolMode,
+            onContextUsage: input.onContextUsage,
+            onReasoning: input.onReasoning,
+            onText: input.onText,
             signal: input.signal,
         });
         let turn: Awaited<ReturnType<typeof requestCanvasAgentTurn>>;
-        try {
-            turn = await requestTurn();
-        } catch (error) {
-            if (!isCanvasAgentContextLimitError(error) || !(await compactHistory())) throw error;
-            systemPrompt = buildCanvasAgentSkillPrompt(state.phase, input.userText, context, activeSkillContents, contextCheckpoint, skillFileToolAvailable);
-            turn = await requestTurn();
+        let triedHistory = false;
+        while (true) {
+            try {
+                turn = await requestTurn();
+                break;
+            } catch (error) {
+                if (!isCanvasAgentContextLimitError(error)) throw error;
+                const compacted = triedHistory ? await compactHistory(true) : await compactForRequest();
+                triedHistory = true;
+                if (!compacted) throw error;
+                systemPrompt = buildPrompt();
+            }
         }
         toolMode = turn.toolMode;
         if (!protocolError && !turn.toolError && toolMode === "native" && !turn.toolCalls.length && turn.content.trim() === CANVAS_AGENT_JSON_FALLBACK_SIGNAL) {
@@ -169,7 +216,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         };
         let nativeActions: CanvasAgentAction[] = [];
         let actionError = turn.toolError || (turn.toolCalls.length
-            ? turn.toolCalls.find((toolCall) => toolCall.argumentsError)?.argumentsError
+            ? turn.toolCalls.find((toolCall) => toolCall.name !== "present_choices" && toolCall.argumentsError)?.argumentsError
             : parsedJson.error);
         if (!actionError) {
             try {
@@ -182,6 +229,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             actionError = "本轮必须返回可执行的画布工具指令";
         }
         if (actionError) {
+            input.onText?.("");
             if (protocolError) throw new Error("工具指令仍无效，本批操作未执行：" + actionError);
             protocolError = actionError;
             const feedback = JSON.stringify({
@@ -202,6 +250,7 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
         }
         const arrangeRequested = canvasAgentAllowsArrangement(input.userText);
         const requestedActions = nativeActions.length ? nativeActions : parsedJson.actions;
+        if (requestedActions.length) input.onText?.("");
         const actions = requestedActions.filter((action) => action.name !== "arrange_nodes" || arrangeRequested);
         const rejectedToolMessages: CanvasAgentProtocolMessage[] = nativeActions.filter((action) => action.name === "arrange_nodes" && !arrangeRequested).map((action) => ({
             role: "tool",
@@ -236,12 +285,17 @@ export async function runCanvasAgent(input: RunCanvasAgentInput): Promise<RunCan
             return { reply: finalReply, state, protocolMessages: persistCanvasAgentProtocolMessages(protocolMessages), contextCheckpoint, jsonFallbackMode: usedJsonFallbackMode };
         }
 
-        expectedAction = false;
-        protocolError = undefined;
-        input.onEvent?.({ status: "running", label: actions.length === 1 ? canvasAgentActionLabel(actions[0]) : "正在执行 " + actions.length + " 个画布操作" });
+        const canvasActions = actions.filter((action) => action.name !== "present_choices");
+        if (canvasActions.length) {
+            input.onEvent?.({ status: "running", label: canvasActions.length === 1 ? canvasAgentActionLabel(canvasActions[0]) : "正在执行 " + canvasActions.length + " 个画布操作" });
+        }
 
         const results = await executeActions(actions, state, input.executeAction, input.signal, input.onEvent);
-        hasExecutedActions = true;
+        if (canvasActions.length || results.items.some(({ action, result }) => action.name === "present_choices" && result.ok)) {
+            expectedAction = false;
+            protocolError = undefined;
+            hasExecutedActions = true;
+        }
         state = results.state;
 
         if (nativeActions.length && toolMode === "native") {
@@ -288,7 +342,7 @@ export async function executeActions(
     let state = initialState;
     const executeOne = async (action: CanvasAgentAction) => {
         throwIfAborted(signal);
-        onEvent?.({ status: "running", label: canvasAgentActionLabel(action) });
+        if (action.name !== "present_choices") onEvent?.({ status: "running", label: canvasAgentActionLabel(action) });
         try {
             const result = await executeAction(action);
             if (action.name === "set_agent_state" && result.ok) state = applyAgentState(state, action.arguments);
@@ -306,7 +360,7 @@ export async function executeActions(
         }
     };
 
-    const items = actions.every(isCanvasAgentMediaAction)
+    const items = actions.every((action) => action.name === "present_choices" || isCanvasAgentMediaAction(action))
         ? await Promise.all(actions.map(executeOne))
         : await actions.reduce<Promise<Array<{ action: CanvasAgentAction; result: CanvasAgentToolResult }>>>(
             async (pending, action) => [...(await pending), await executeOne(action)],
@@ -341,7 +395,7 @@ function persistCanvasAgentProtocolMessages(messages: CanvasAgentProtocolMessage
                 .map((item) => item.text)
                 .join("\n")
                 .trim();
-            return { role: message.role, content: text || "本轮包含图片引用；媒体内容未写入会话记录。" };
+            return { ...message, content: text || "本轮包含图片引用；媒体内容未写入会话记录。" };
         }
         return message;
     });

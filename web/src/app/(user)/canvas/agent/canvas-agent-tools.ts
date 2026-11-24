@@ -3,6 +3,7 @@ import { nanoid } from "nanoid";
 import type { CanvasAgentPhase } from "../types";
 
 export const CANVAS_AGENT_ACTION_NAMES = [
+    "present_choices",
     "get_canvas_summary",
     "get_selected_nodes",
     "query_canvas_nodes",
@@ -28,6 +29,7 @@ export const CANVAS_AGENT_ACTION_NAMES = [
     "generate_video",
     "generate_audio",
     "get_media_task_status",
+    "analyze_video",
 ] as const;
 
 export type CanvasAgentActionName = (typeof CANVAS_AGENT_ACTION_NAMES)[number];
@@ -90,7 +92,25 @@ function defineTool(name: CanvasAgentActionName, description: string, properties
 
 export const CANVAS_AGENT_SKILL_FILE_TOOL = defineTool("read_skill_file", "按相对路径读取当前激活系统 Skill 的附属 Markdown 或文本文件。仅当 SKILL.md 明确引用附属文件时使用。", { skillId: STRING, path: STRING }, ["skillId", "path"]);
 
+export const CANVAS_AGENT_VIDEO_TOOL = defineTool(
+    "analyze_video",
+    "分析真实视频节点的画面，传 nodeId 和 question。默认每 1 秒取一帧。用户要求精细拆解，或问题需要看构图、表情、字幕或动作细节时，传 detailed: true，每 0.5 秒取一帧。只把视频作为生成参考时无需调用。",
+    { nodeId: STRING, question: STRING, detailed: { type: "boolean" }, startMs: { type: "integer", minimum: 0 }, endMs: { type: "integer", minimum: 1 } },
+    ["nodeId", "question"],
+);
+
 export const CANVAS_AGENT_TOOLS: CanvasAgentToolDefinition[] = [
+    defineTool("present_choices", "只在下一步确实需要用户做选择时调用。一次提交一道或多道单选题。", {
+        questions: {
+            type: "array",
+            items: {
+                type: "object",
+                properties: { question: STRING, options: { type: "array", items: STRING } },
+                required: ["question", "options"],
+                additionalProperties: false,
+            },
+        },
+    }, ["questions"]),
     defineTool("get_canvas_summary", "读取当前画布摘要、节点、连线、模型配置和任务状态。"),
     defineTool("get_selected_nodes", "读取用户当前选中的真实画布节点。"),
     defineTool("query_canvas_nodes", "当默认上下文中没有目标节点 ID 时，按 ID、关键词或类型只读查询画布节点；找到 ID 后再用 get_node 读取详情。", {
@@ -166,7 +186,7 @@ export const CANVAS_AGENT_TOOLS: CanvasAgentToolDefinition[] = [
             sourceNodeIds: STRING_ARRAY,
             size: STRING,
             seconds: { type: "integer", minimum: -1, maximum: 30, description: "本次视频任务的总时长（秒），不是每个内部镜头的时长。按 videoDuration 的合法范围或离散值填写已确认时长；仅省略时使用当前 videoSeconds 默认值，不得把默认值当成上限。-1 仅用于支持智能时长的模型。" },
-            generateAudio: { type: "boolean" },
+            generateAudio: { type: "boolean", description: "仅在用户明确要求本次启用视频音频或将整个视频静音时传入。其余情况省略，沿用全局视频音频设置。无背景音乐和无字幕要求写入 prompt。" },
         },
         ["prompt", "sourceNodeIds"],
     ),
@@ -181,6 +201,16 @@ export const CANVAS_AGENT_TOOLS: CanvasAgentToolDefinition[] = [
 
 export function normalizeCanvasAgentAction(name: unknown, args: unknown, id = nanoid()): CanvasAgentAction {
     if (typeof name !== "string" || !ACTION_NAME_SET.has(name)) throw new Error("模型返回了不允许的工具");
+    if (name === "present_choices") {
+        const items = isRecord(args) && Array.isArray(args.questions) ? args.questions : [];
+        const questions = items.flatMap((item) => {
+            if (!isRecord(item) || typeof item.question !== "string" || !Array.isArray(item.options)) return [];
+            const question = item.question.trim();
+            const options = [...new Set<string>(item.options.map((option: unknown) => typeof option === "string" ? option.trim() : "").filter(Boolean))];
+            return question && options.length >= 2 ? [{ question, options }] : [];
+        });
+        return { id, name, arguments: { questions } };
+    }
     if (args !== undefined && !isRecord(args)) throw new Error(name + " 的 arguments 必须是对象");
     const input = isRecord(args) ? args : {};
     const definition = canvasAgentToolDefinition(name);
@@ -221,6 +251,23 @@ export function normalizeCanvasAgentAction(name: unknown, args: unknown, id = na
         case "read_skill_file":
             normalized = { skillId: requiredString(input.skillId, "skillId"), path: requiredString(input.path, "path") };
             break;
+        case "analyze_video": {
+            const { startMs, endMs, detailed } = input;
+            if (detailed !== undefined && typeof detailed !== "boolean") throw new Error("detailed 必须是布尔值");
+            if ((startMs !== undefined || endMs !== undefined) && (
+                typeof startMs !== "number" || typeof endMs !== "number" ||
+                !Number.isSafeInteger(startMs) || !Number.isSafeInteger(endMs) || startMs < 0 || endMs <= startMs
+            )) {
+                throw new Error("请提供有效的视频起止时间");
+            }
+            normalized = {
+                nodeId: requiredString(input.nodeId, "nodeId"),
+                question: requiredString(input.question, "question"),
+                ...(detailed === true ? { detailed } : {}),
+                ...(startMs !== undefined ? { startMs, endMs } : {}),
+            };
+            break;
+        }
         case "delete_connection":
             normalized = { connectionId: requiredString(input.connectionId, "connectionId") };
             break;
@@ -344,15 +391,23 @@ export async function parseCanvasAgentJson(content: string, { allowRepair = fals
         if (!isRecord(payload) || !Object.prototype.hasOwnProperty.call(payload, "actions")) return { parsed: false, actions: [], reply: content.trim() };
         actionPayload = true;
         if (!Array.isArray(payload.actions)) throw new Error("actions 必须是数组");
-        if (payload.actions.length > 12) throw new Error("单次最多执行 12 个画布操作，请拆分调用");
+        let hasChoiceCall = false;
+        const batch = payload.actions.filter((item) => {
+            if (!isRecord(item) || (item.tool || item.name) !== "present_choices") return true;
+            if (hasChoiceCall) return false;
+            hasChoiceCall = true;
+            return true;
+        });
+        const canvasActionCount = batch.length - (hasChoiceCall ? 1 : 0);
+        if (canvasActionCount > 12) throw new Error("单次最多执行 12 个画布操作，请拆分调用");
         const outerKeys = Object.keys(payload).filter((key) => key !== "actions" && key !== "reply");
         if (outerKeys.length) throw new Error("JSON 外层不支持字段：" + outerKeys.join("、") + "；工具参数必须放在对应 action 的 arguments 中");
-        const actions = payload.actions.map((item) => {
+        const actions = batch.map((item) => {
             if (!isRecord(item)) throw new Error("actions 中的每项必须是工具调用对象");
             const name = item.tool || item.name;
             const misplacedKeys = Object.keys(item).filter((key) => !["id", "tool", "name", "arguments"].includes(key));
             let args = item.arguments;
-            if (misplacedKeys.length) {
+            if (misplacedKeys.length && name !== "present_choices") {
                 if (typeof name !== "string" || !ACTION_NAME_SET.has(name)) throw new Error("模型返回了不允许的工具");
                 if (args !== undefined && !isRecord(args)) throw new Error(name + " 的 arguments 必须是对象");
                 const supported = canvasAgentToolDefinition(name).function.parameters.properties;
@@ -374,11 +429,13 @@ export async function parseCanvasAgentJson(content: string, { allowRepair = fals
 }
 
 function canvasAgentToolDefinition(name: string) {
+    if (name === "analyze_video") return CANVAS_AGENT_VIDEO_TOOL;
     return name === "read_skill_file" ? CANVAS_AGENT_SKILL_FILE_TOOL : CANVAS_AGENT_TOOLS.find((tool) => tool.function.name === name)!;
 }
 
 export function canvasAgentActionLabel(action: CanvasAgentAction) {
     const labels: Record<CanvasAgentActionName, string> = {
+        present_choices: "正在准备选项",
         get_canvas_summary: "正在读取画布",
         get_selected_nodes: "正在读取选中节点",
         query_canvas_nodes: "正在查找画布节点",
@@ -404,6 +461,7 @@ export function canvasAgentActionLabel(action: CanvasAgentAction) {
         generate_video: "正在创建视频节点",
         generate_audio: "正在创建音频节点",
         get_media_task_status: "正在读取媒体任务",
+        analyze_video: "正在分析视频画面",
     };
     return labels[action.name];
 }

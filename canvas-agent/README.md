@@ -11,7 +11,7 @@ codex plugin marketplace add https://github.com/TNTest/infinite-canvas.git
 codex plugin add canvas-agent@infinite-canvas
 ```
 
-需要 Node.js 22+ 和 npm。GitHub 插件从本仓库取得源码，用 npx 安装本地包及依赖。npm 上已发布的 0.1.3 可单独用作网页桥接服务。安装后新建 Codex 对话，移除插件可运行 `codex plugin remove canvas-agent`。
+需要 Node.js 22+ 和 npm。GitHub 插件从本仓库取得源码，用 npx 安装本地包及依赖。npm 上已发布的 0.1.6 可单独用作网页桥接服务。安装后新建 Codex 对话，移除插件可运行 `codex plugin remove canvas-agent`。
 
 ## API Key 模式
 
@@ -60,16 +60,16 @@ CANVAS_API_PROJECT = "/absolute/path/to/your-project"
 安装 Node.js 22+ 后，在终端执行，npx 会从 npm 获取服务及依赖：
 
 ```sh
-npx -y @tigerowo/canvas-agent@0.1.3
+npx -y @tigerowo/canvas-agent@0.1.6
 ```
 
 首次启动自动生成 Token，保存在当前用户的 `~/.infinite-canvas/codex-agent.json`；下次启动复用。终端显示 `Local URL` 和 `Connect token`，默认地址为 `http://127.0.0.1:3210`。网页与服务在同一台电脑运行，不需要克隆仓库或手工创建 `.env`；正确 Token 连接后自动记录网站来源。
 
-Codex 尚未登录时执行 `npx -y @openai/codex@0.159.2 login` 并完成登录，已有登录态会直接复用。
+Codex 尚未登录时执行 `npx -y @openai/codex@0.169.1 login` 并完成登录，已有登录态会直接复用。
 
 ## 本机配置与范围
 
-`npx -y @tigerowo/canvas-agent@0.1.3 config` 输出 `{url, token, origins}`，首次尚未启动时会提示先启动服务。HTTP `GET /config` 只返回 `{url, hasToken}`；Token 和包含它的连接链接不要分享。
+`npx -y @tigerowo/canvas-agent@0.1.6 config` 输出 `{url, token, origins}`，首次尚未启动时会提示先启动服务。HTTP `GET /config` 只返回 `{url, hasToken}`；Token 和包含它的连接链接不要分享。
 
 `CANVAS_AGENT_TOKEN`、`CANVAS_AGENT_PORT`、`CANVAS_AGENT_ORIGINS` 可选环境变量覆盖 Token、端口和预置来源；更改后重启服务。通常无需设置。
 

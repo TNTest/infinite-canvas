@@ -1,9 +1,11 @@
 "use client";
 
-import { type CSSProperties, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
     History,
     Bot,
+    Brain,
+    ChevronRight,
     Clapperboard,
     Copy,
     Cpu,
@@ -11,6 +13,7 @@ import {
     Group,
     Image as ImageIcon,
     ArrowLeftRight,
+    LoaderCircle,
     Music2,
     PanelRightClose,
     Pencil,
@@ -27,19 +30,21 @@ import {
 import { App, AutoComplete, Button, Dropdown, Modal, Segmented, Switch, Tooltip } from "antd";
 import { motion } from "motion/react";
 import { nanoid } from "nanoid";
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import { ImageGenerationPending } from "@/components/image-generation-pending";
 import { useCopyText } from "@/hooks/use-copy-text";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { cn } from "@/lib/utils";
 import { fetchSystemAgentSkillFile } from "@/services/api/agent-skills";
+import { analyzeCanvasVideo } from "@/services/api/canvas-video-analysis";
+import { downloadRemoteMedia, resolveMediaUrl } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useAgentSkillStore } from "@/stores/use-agent-skill-store";
 import { useConfigStore, useEffectiveConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
+import { useUserStore } from "@/stores/use-user-store";
 import { createCanvasAgentState, runCanvasAgent } from "../agent/canvas-agent-runtime";
 import { useCodexAgent } from "../agent/use-codex-agent";
 import type { CanvasAgentContext } from "../agent/canvas-agent-context";
@@ -51,6 +56,7 @@ import {
     type CanvasAgentSkillSelection,
     type CanvasAgentState,
     type CanvasAssistantMessage,
+    type CanvasAssistantQuestion,
     type CanvasAssistantReference,
     type CanvasAssistantSession,
     type CanvasNodeData,
@@ -144,10 +150,12 @@ export function CanvasAssistantPanel({
     const consumedInitialRequestRef = useRef<typeof initialRequest>(null);
     const pendingDeleteRef = useRef<PendingDeleteConfirmation | null>(null);
     const messageListRef = useRef<HTMLDivElement>(null);
+    const followMessagesRef = useRef(true);
     const consumedReferenceNodeClickVersionRef = useRef(0);
     const [view, setView] = useState<"chat" | "history" | "connect">("chat");
     const [prompt, setPrompt] = useState("");
     const [isRunning, setIsRunning] = useState(false);
+    const [replyPreview, setReplyPreview] = useState<{ id: string; text: string } | null>(null);
     const [checkedChatIds, setCheckedChatIds] = useState<string[]>([]);
     const [deleteChatIds, setDeleteChatIds] = useState<string[]>([]);
     const [settingsOpen, setSettingsOpen] = useState(false);
@@ -182,12 +190,15 @@ export function CanvasAssistantPanel({
     const activeSession = visibleSessions.find((session) => session.id === resolvedActiveSessionId) || visibleSessions[0] || null;
     const historySessions = visibleSessions.filter((session) => session.messages.length > 0);
     const messages = activeSession?.messages || [];
+    const displayedMessages = replyPreview ? messages.map((message) => message.id === replyPreview.id ? { ...message, text: replyPreview.text } : message) : messages;
     const hasMessages = messages.length > 0;
     const selectedNodeKey = useMemo(() => Array.from(selectedNodeIds).sort().join(","), [selectedNodeIds]);
 
     const resourceReferences = useMemo(() => buildAllCanvasResourceReferences(nodes), [nodes]);
     const resourceReferenceById = useMemo(() => new Map(resourceReferences.map((reference) => [reference.nodeId, reference])), [resourceReferences]);
     const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+    const videoNodesRef = useRef(nodeById);
+    useLayoutEffect(() => { videoNodesRef.current = nodeById; }, [nodeById]);
     const resolveReferences = useCallback((ids: string[]) => ids.flatMap((id) => {
         const node = nodeById.get(id);
         const resource = resourceReferenceById.get(id);
@@ -337,13 +348,33 @@ export function CanvasAssistantPanel({
     const codex = useCodexAgent({
         canvasId,
         onBootstrap: () => { if (mode === "api") switchMode(); else setView("chat"); },
+        readVideo: async (nodeId, signal) => {
+            const node = videoNodesRef.current.get(nodeId);
+            const metadata = node?.metadata;
+            if (node?.type !== CanvasNodeType.Video || (!metadata?.content && !metadata?.storageKey)) {
+                throw new Error("请选择当前画布上已有视频的节点");
+            }
+            const token = useUserStore.getState().token;
+            const source = await resolveMediaUrl(metadata.storageKey, metadata.content || "");
+            signal.throwIfAborted();
+            if (!source) throw new Error("找不到原视频");
+            const video = await downloadRemoteMedia(source, { signal, direct: true }).catch((error) => {
+                const url = new URL(source, location.href);
+                if (signal.aborted || !(error instanceof TypeError) ||
+                    !["http:", "https:"].includes(url.protocol) || url.origin === location.origin) throw error;
+                return url.href;
+            });
+            if (useUserStore.getState().token !== token) throw new Error("登录状态已变化，请重新发起视频分析");
+            return video;
+        },
         executeTool: async (action, signal) => {
             if (action.name === "arrange_nodes" && !(await confirmCodex("允许 Codex 整理画布？", <pre className="whitespace-pre-wrap break-words text-xs">{JSON.stringify(action.arguments, null, 2)}</pre>, signal))) return { ok: false, code: "action_not_requested", message: "未允许整理画布" };
             return executeCanvasTool(action, [], [], "codex", signal);
         },
         onApproval: async ({ method, params }, signal) => {
             if (method === "mcpServer/elicitation/request") {
-                appMessage.info("Codex 工具请求了额外信息，本次请求已取消");
+                const detail = typeof params.message === "string" ? params.message.trim() : "";
+                appMessage.info(`Codex 工具请求了额外信息${detail ? `（${detail}）` : ""}，本次请求已取消`);
                 return { action: "decline", content: null };
             }
             const questions = method === "item/tool/requestUserInput"
@@ -383,13 +414,16 @@ export function CanvasAssistantPanel({
     const codexEffort = agentConfig.codexEffort || codexModel?.defaultReasoningEffort;
     const showCodexConnection = mode === "codex" && (view === "connect" || (view === "chat" && codex.status !== "ready"));
     useEffect(() => {
+        followMessagesRef.current = true;
+    }, [resolvedActiveSessionId, view, showCodexConnection]);
+    useEffect(() => {
         if (view !== "chat" || showCodexConnection) return;
         const frame = window.requestAnimationFrame(() => {
             const element = messageListRef.current;
-            if (element) element.scrollTop = element.scrollHeight;
+            if (element && followMessagesRef.current) element.scrollTop = element.scrollHeight;
         });
         return () => window.cancelAnimationFrame(frame);
-    }, [messages, view, showCodexConnection]);
+    }, [displayedMessages, view, showCodexConnection, resolvedActiveSessionId]);
     const codexControls = mode === "codex" ? (
         <>
             <Dropdown trigger={["click"]} placement="topLeft" disabled={isRunning || !codex.models.length} menu={{ selectable: true, selectedKeys: codexModel ? [codexModel.model] : [], items: codex.models.map((item) => ({ key: item.model, label: item.displayName })), onClick: ({ key }) => onAgentConfigChange({ codexModel: key, codexEffort: undefined }) }}>
@@ -439,8 +473,11 @@ export function CanvasAssistantPanel({
         const messageReferenceNodeIds = references.map((reference) => reference.id);
         const userMessage: CanvasAssistantMessage = { id: nanoid(), role: "user", text, references, skills: activeSkills, skillsSelected: showSelectedSkills, status: "success" };
         const assistantId = nanoid();
+        let reasoning = "";
+        let questions: CanvasAssistantQuestion[] | undefined;
+        followMessagesRef.current = true;
         appendMessage(session.id, userMessage);
-        appendMessage(session.id, { id: assistantId, role: "assistant", text: "", status: "thinking", activity: "正在理解画布和创作目标" });
+        appendMessage(session.id, { id: assistantId, role: "assistant", text: "", status: "thinking" });
         setPrompt("");
         setComposerReferenceIds([]);
         setSelectedSkills([]);
@@ -466,6 +503,12 @@ export function CanvasAssistantPanel({
         }
 
         const controller = new AbortController();
+        const { token: initialToken, user: initialUser } = useUserStore.getState();
+        const videoAnalysisSkill = activeSkillContents.some(({ content }) => /\banalyze_video\b/.test(content));
+        const enableVideoAnalysis = mode === "api" &&
+            Boolean(initialToken && initialUser && initialUser.role !== "guest") &&
+            (references.some(({ type }) => type === CanvasNodeType.Video) || videoAnalysisSkill);
+        let stopWatchingVideoAccount: (() => void) | undefined;
         abortRef.current = controller;
         setIsRunning(true);
         try {
@@ -481,6 +524,7 @@ export function CanvasAssistantPanel({
             );
             const run = mode === "codex" ? (input: Parameters<typeof runCanvasAgent>[0]) => codex.run({
                 ...input, threadId: session.codexThreadId, serviceId: session.codexServiceId, model: codexModel?.model, effort: codexEffort,
+                skillsSelected: input.skillsSelected || skillOverride !== undefined,
                 onThread: (codexThreadId, codexServiceId) => updateSession(session.id, (current) => ({ ...current, codexThreadId, codexServiceId })),
                 onText: (text) => updateMessage(session.id, assistantId, { text }),
             }) : runCanvasAgent;
@@ -491,12 +535,67 @@ export function CanvasAssistantPanel({
                 userText: text,
                 references: modelReferences,
                 activeSkillContents,
+                ...(enableVideoAnalysis ? { enableVideoAnalysis: true } : {}),
+                skillsSelected: userMessage.skillsSelected,
                 contextCheckpoint: session.contextCheckpoint,
                 preferredJsonMode: session.jsonToolFallbackKey === jsonToolFallbackKey ? session.jsonToolFallbackMode || "structured-json" : undefined,
                 getContext: getAgentContext,
-                executeAction: (action, signal = controller.signal) => executeCanvasTool(action, messageReferenceNodeIds, activeSkills, mode, signal),
+                executeAction: async (action, signal = controller.signal) => {
+                    if (action.name === "present_choices") {
+                        signal.throwIfAborted();
+                        const next = action.arguments.questions as CanvasAssistantQuestion[];
+                        if (!next.length) return { ok: false, code: "invalid_choices", message: "每道题至少需要两个选项" };
+                        questions = next;
+                        return { ok: true };
+                    }
+                    if (mode !== "api" || action.name !== "analyze_video") {
+                        return executeCanvasTool(action, messageReferenceNodeIds, activeSkills, mode, signal);
+                    }
+                    signal.throwIfAborted();
+                    const { nodeId, question, startMs, endMs, detailed } = action.arguments as {
+                        nodeId: string; question: string; startMs?: number; endMs?: number; detailed?: boolean;
+                    };
+                    if (!enableVideoAnalysis || (!videoAnalysisSkill && !messageReferenceNodeIds.includes(nodeId))) {
+                        return { ok: false, code: "video_reference_required", message: "请引用需要分析的视频" };
+                    }
+                    const node = videoNodesRef.current.get(nodeId);
+                    const metadata = node?.metadata;
+                    if (node?.type !== CanvasNodeType.Video || (!metadata?.content && !metadata?.storageKey)) {
+                        return { ok: false, code: "video_required", message: "请选择当前画布上已有视频的节点" };
+                    }
+                    const { token, user } = useUserStore.getState();
+                    if (!token || !user || user.role === "guest") {
+                        return { ok: false, code: "login_required", message: "请先登录再分析视频" };
+                    }
+                    if (token !== initialToken) {
+                        return { ok: false, code: "login_changed", message: "登录状态已变化，请重新发起视频分析" };
+                    }
+                    stopWatchingVideoAccount ??= useUserStore.subscribe((state) => {
+                        if (state.token !== token) controller.abort(new DOMException("登录状态已变化", "AbortError"));
+                    });
+                    return analyzeCanvasVideo({
+                        config: requestConfig,
+                        signal,
+                        token,
+                        nodeId,
+                        source: metadata.content || "",
+                        storageKey: metadata.storageKey,
+                        question,
+                        startMs,
+                        endMs,
+                        detailed,
+                    });
+                },
                 signal: controller.signal,
                 onEvent: (event) => updateMessage(session.id, assistantId, { status: event.status, activity: event.label }),
+                onText: mode === "api" && requestConfig.textStreaming
+                    ? (text) => setReplyPreview(text ? { id: assistantId, text } : null)
+                    : undefined,
+                onReasoning: (delta) => {
+                    reasoning += delta;
+                    updateMessage(session.id, assistantId, { reasoning });
+                },
+                onContextUsage: (usage) => updateSession(session.id, (current) => ({ ...current, contextUsage: usage })),
                 onCheckpoint: (checkpoint) =>
                     updateSession(session.id, (current) => ({
                         ...current,
@@ -516,18 +615,26 @@ export function CanvasAssistantPanel({
                 jsonToolFallbackKey: result.jsonFallbackMode ? jsonToolFallbackKey : undefined,
                 jsonToolFallbackMode: result.jsonFallbackMode,
                 messages: current.messages.map((message) =>
-                    message.id === assistantId ? { ...message, text: result.reply, status: "success", activity: undefined } : message,
+                    message.id === assistantId ? {
+                        ...message,
+                        text: controller.signal.aborted ? message.text : result.reply,
+                        questions: controller.signal.aborted ? undefined : questions,
+                        status: "success",
+                        activity: undefined,
+                    } : message,
                 ),
                 updatedAt: new Date().toISOString(),
             }));
         } catch (error) {
             const stopped = error instanceof Error && error.name === "AbortError";
             updateMessage(session.id, assistantId, {
-                text: stopped ? "已停止继续执行。已经创建的节点和已经提交的媒体任务会保留。" : error instanceof Error ? error.message : "Agent 执行失败",
+                ...(stopped || controller.signal.aborted ? {} : { text: error instanceof Error ? error.message : "Agent 执行失败" }),
                 status: stopped ? "waiting" : "error",
                 activity: undefined,
             });
         } finally {
+            setReplyPreview(null);
+            stopWatchingVideoAccount?.();
             if (abortRef.current === controller) abortRef.current = null;
             setIsRunning(false);
         }
@@ -542,18 +649,18 @@ export function CanvasAssistantPanel({
 
     const submit = async (nextPrompt = prompt, referenceIds = composerReferenceIds) => {
         const text = nextPrompt.trim();
-        if (!text || isRunning) return;
+        if ((!text && !selectedSkills.length) || isRunning) return;
         await sendMessage(text, resolveReferences(referenceIds));
     };
 
     const retryMessage = (message: CanvasAssistantMessage) => {
         const index = messages.findIndex((item) => item.id === message.id);
         const user = messages.slice(0, index).findLast((item) => item.role === "user");
-        if (user) void sendMessage(user.text, user.references, user.skills || []);
+        if (user) void sendMessage(user.text, user.references, user.skills || [], user.skillsSelected);
     };
 
     const startResize = () => {
-        const move = (event: MouseEvent) => onWidthChange(Math.min(760, Math.max(464, window.innerWidth - event.clientX)));
+        const move = (event: MouseEvent) => onWidthChange(Math.min(760, Math.max(320, window.innerWidth - event.clientX)));
         const stop = () => {
             setResizing(false);
             document.body.style.cursor = "";
@@ -637,7 +744,15 @@ export function CanvasAssistantPanel({
                     </div>
                 </div>
 
-                <div ref={messageListRef} className="thin-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
+                <div
+                    ref={messageListRef}
+                    className="thin-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4"
+                    onScroll={(event) => {
+                        if (view !== "chat" || showCodexConnection) return;
+                        const { scrollHeight, scrollTop, clientHeight } = event.currentTarget;
+                        followMessagesRef.current = scrollHeight - scrollTop - clientHeight <= 2;
+                    }}
+                >
                     {showCodexConnection ? <CanvasCodexConnectView agent={codex} onChat={() => setView("chat")} /> : view === "history" ? (
                         <AssistantHistory
                             sessions={historySessions}
@@ -653,7 +768,7 @@ export function CanvasAssistantPanel({
                             onDelete={(id) => setDeleteChatIds([id])}
                         />
                     ) : messages.length ? (
-                        <AssistantMessages messages={messages} nodeById={nodeById} onFocusNode={onFocusNode} onRetry={retryMessage} codexMode={mode === "codex"} />
+                        <AssistantMessages messages={displayedMessages} nodeById={nodeById} onFocusNode={onFocusNode} onRetry={retryMessage} onSubmitChoice={!isRunning ? submit : undefined} />
                     ) : (
                         <div className="flex h-full flex-col items-center justify-center px-8 text-center">
                             <div className="grid size-12 place-items-center rounded-2xl" style={{ background: theme.node.fill }}>
@@ -679,6 +794,7 @@ export function CanvasAssistantPanel({
                         prompt={prompt}
                         isRunning={isRunning}
                         codexControls={codexControls}
+                        contextUsage={mode !== "codex" || activeSession?.contextUsage?.threadId === activeSession?.codexThreadId ? activeSession?.contextUsage : undefined}
                         references={composerReferences}
                         availableReferences={resourceReferences}
                         pendingReferences={pendingReferences}
@@ -818,14 +934,54 @@ function AssistantMarkdown({ children, components }: { children: string; compone
     );
 }
 
-function AssistantMessages({ messages, nodeById, onFocusNode, onRetry, codexMode }: { messages: CanvasAssistantMessage[]; nodeById: ReadonlyMap<string, CanvasNodeData>; onFocusNode: (nodeId: string) => void; onRetry: (message: CanvasAssistantMessage) => void; codexMode?: boolean }) {
+function getAssistantCanvasNode(node: ExtraProps["node"], text: string, nodeById: ReadonlyMap<string, CanvasNodeData>) {
+    return node?.position?.start.line === node?.position?.end.line ? nodeById.get(text.trim()) : undefined;
+}
+
+function AssistantChoiceCard({ questions, onSubmit }: { questions: CanvasAssistantQuestion[]; onSubmit: (text: string) => Promise<void> }) {
+    const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const [questionIndex, setQuestionIndex] = useState(0);
+    const [answers, setAnswers] = useState<Record<number, number>>({});
+    const { question, options } = questions[questionIndex];
+    const allAnswered = questions.every((_, index) => answers[index] !== undefined);
+
+    return (
+        <form className="my-2 grid w-full gap-1 rounded-2xl border p-2.5 text-sm" style={{ background: theme.node.panel, borderColor: theme.node.stroke, "--choice-hover": theme.toolbar.itemHover, "--choice-active": theme.toolbar.activeBg, "--choice-number-bg": theme.node.text, "--choice-number-text": theme.node.panel } as CSSProperties}
+            onSubmit={(event) => {
+                event.preventDefault();
+                if (allAnswered) void onSubmit(questions.map((group, index) => group.options[answers[index]]).join("\n"));
+            }}
+        >
+            <div className="mb-1 flex items-start justify-between gap-2 px-2">
+                <span className="min-w-0 break-words font-medium">{question}</span>
+                {questions.length > 1 ? (
+                    <div className="flex shrink-0 items-center gap-1 text-xs">
+                        <button type="button" aria-label="上一题" disabled={questionIndex === 0} className="cursor-pointer disabled:cursor-default disabled:opacity-30" onClick={() => setQuestionIndex(questionIndex - 1)}><ChevronRight className="size-4 rotate-180" /></button>
+                        <span aria-live="polite">{questionIndex + 1}/{questions.length}</span>
+                        <button type="button" aria-label="下一题" disabled={questionIndex === questions.length - 1} className="cursor-pointer disabled:cursor-default disabled:opacity-30" onClick={() => setQuestionIndex(questionIndex + 1)}><ChevronRight className="size-4" /></button>
+                    </div>
+                ) : null}
+            </div>
+            {options.map((option, index) => (
+                <label key={index} className="flex cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 leading-5 hover:not-has-checked:bg-[var(--choice-hover)] has-checked:bg-[var(--choice-active)] has-checked:inset-ring-1 has-checked:inset-ring-[var(--choice-number-bg)] has-focus-visible:outline">
+                    <input type="radio" name="choice" className="peer sr-only" checked={answers[questionIndex] === index} onChange={() => setAnswers((previous) => ({ ...previous, [questionIndex]: index }))} />
+                    <span aria-hidden="true" className="mt-0.5 grid h-4 min-w-4 shrink-0 place-items-center rounded-sm bg-[var(--choice-active)] px-0.5 text-[11px] leading-none peer-checked:bg-[var(--choice-number-bg)] peer-checked:text-[color:var(--choice-number-text)]">{index + 1}</span>
+                    <span className="min-w-0 whitespace-pre-wrap [overflow-wrap:anywhere]">{option}</span>
+                </label>
+            ))}
+            <button type="submit" disabled={!allAnswered} className="mt-2! h-[26px] w-11 justify-self-end cursor-pointer rounded-lg text-xs! font-medium disabled:cursor-default disabled:opacity-40" style={{ background: theme.node.text, color: theme.node.panel }}>发送</button>
+        </form>
+    );
+}
+
+function AssistantMessages({ messages, nodeById, onFocusNode, onRetry, onSubmitChoice }: { messages: CanvasAssistantMessage[]; nodeById: ReadonlyMap<string, CanvasNodeData>; onFocusNode: (nodeId: string) => void; onRetry: (message: CanvasAssistantMessage) => void; onSubmitChoice?: (text: string) => Promise<void> }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const copyText = useCopyText();
     const markdownComponents = useMemo<Components>(() => ({
         ...ASSISTANT_MARKDOWN_COMPONENTS,
         code: ({ node, className, children, ...props }) => {
-            const canvasNode = nodeById.get(String(children).trim());
-            if (node?.position?.start.line === node?.position?.end.line && canvasNode) {
+            const canvasNode = getAssistantCanvasNode(node, String(children), nodeById);
+            if (canvasNode) {
                 const { Icon, label: typeLabel } = ASSISTANT_NODE_TYPE_META[canvasNode.type];
                 const hasImage = isCanvasImageNodeType(canvasNode.type) && canvasNode.metadata?.content;
                 return (
@@ -851,34 +1007,52 @@ function AssistantMessages({ messages, nodeById, onFocusNode, onRetry, codexMode
     return (
         <>
             {messages.map((message) => {
+                const submitChoice = message.role === "assistant" && message === messages.at(-1) && message.status === "success" ? onSubmitChoice : undefined;
+                const questions = submitChoice ? message.questions : undefined;
                 const running = message.status === "thinking" || message.status === "running";
+                const reasoning = message.reasoning?.trim();
                 const showSkills = message.skillsSelected ?? Boolean(message.skills?.length && !sameSkillSelections(message.skills, previousUserSkills));
                 if (message.role === "user") previousUserSkills = message.skills || [];
                 return (
                     <div key={message.id} className={cn("flex flex-col gap-2", message.role === "user" ? "items-end" : "items-start")}>
-                        {message.text ? (
+                        {running ? (
+                            <div className="w-full text-sm">
+                                <div role="status" className="flex items-center gap-1.5 opacity-75">
+                                    <span className="inline-flex motion-safe:animate-spin" aria-hidden="true"><LoaderCircle className="size-3.5" /></span>
+                                    {message.activity || "思考中…"}
+                                </div>
+                                {reasoning ? (
+                                    <div className="relative mt-1.5 h-20 overflow-hidden leading-5 opacity-65">
+                                        <div className="absolute inset-x-0 bottom-0 min-h-full whitespace-pre-wrap [overflow-wrap:anywhere]">{reasoning}</div>
+                                    </div>
+                                ) : null}
+                            </div>
+                        ) : reasoning ? (
+                            <details className="group w-full text-[13px] opacity-75 motion-safe:[interpolate-size:allow-keywords] details-content:h-0 details-content:overflow-clip open:details-content:h-auto motion-safe:details-content:transition-[height,content-visibility] motion-safe:details-content:transition-discrete">
+                                <summary className="group/title flex! w-fit cursor-pointer list-none items-center gap-1.5 text-sm [&::-webkit-details-marker]:hidden">
+                                    <Brain className="size-3.5" /> 思考过程
+                                    <ChevronRight className="size-3 opacity-0 motion-safe:transition-opacity group-hover/title:opacity-100 group-open:rotate-90 group-open:opacity-100" aria-hidden="true" />
+                                </summary>
+                                <div className="mt-1.5 whitespace-pre-wrap leading-5 [overflow-wrap:anywhere]">{reasoning}</div>
+                            </details>
+                        ) : null}
+                        {message.text || questions?.length || (message.role === "user" && showSkills && message.skills?.length) ? (
                             <div
-                                className="max-w-[88%] whitespace-pre-wrap rounded-2xl px-3 py-2 text-sm leading-6"
+                                className={cn("max-w-[88%] whitespace-pre-wrap rounded-2xl py-2 text-sm leading-6", message.role === "user" && "px-3")}
                                 style={
                                     message.role === "user"
                                         ? { background: theme.toolbar.activeBg, color: theme.toolbar.activeText }
-                                        : message.status === "error"
-                                            ? { background: theme.node.fill, color: theme.node.text }
-                                            : { background: theme.node.fill, color: theme.node.text }
+                                        : { color: theme.node.text }
                                 }
                             >
                                 {message.role === "assistant" ? (
-                                    <div className="mb-1 flex items-center gap-1.5 text-xs opacity-60">
-                                        <Bot className="size-3.5" />
-                                        {codexMode ? "Codex" : "Agent"}
-                                    </div>
-                                ) : null}
-                                {message.role === "assistant" ? <AssistantMarkdown components={markdownComponents}>{message.text}</AssistantMarkdown> : <UserMessageContent message={message} showSkills={showSkills} />}
+                                    <AssistantMarkdown components={markdownComponents}>{message.text}</AssistantMarkdown>
+                                ) : <UserMessageContent message={message} showSkills={showSkills} />}
+                                {submitChoice && questions?.length ? <AssistantChoiceCard questions={questions} onSubmit={submitChoice} /> : null}
                             </div>
                         ) : null}
-                        {running ? <ImageGenerationPending compact label={message.activity || "正在执行"} className="w-[250px] rounded-2xl border" /> : null}
                         {!running && message.text ? (
-                            <div className="flex gap-1">
+                            <div className={cn("flex gap-1", message.role === "assistant" && "-mt-3")}>
                                 <Button shape="circle" size="small" style={{ borderColor: theme.node.stroke }} icon={<Copy className="size-3.5" />} onClick={() => copyText(message.text, "消息已复制")} title="复制" />
                                 {message.role === "assistant" ? <Button shape="circle" size="small" style={{ borderColor: theme.node.stroke }} icon={<RotateCcw className="size-3.5" />} onClick={() => onRetry(message)} title="重试" /> : null}
                             </div>
